@@ -6,6 +6,8 @@ selectWindow("C1-" + origTitle);
 close();
 selectWindow("C2-" + origTitle);
 close();
+selectWindow("C4-" + origTitle);
+close();
 
 selectWindow("C3-" + origTitle);
 

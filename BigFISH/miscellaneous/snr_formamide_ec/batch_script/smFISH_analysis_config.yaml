@@ -1,0 +1,41 @@
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+# YAML configuration for Bigfish batch processing
+# Modified: 2023.03.07
+# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # 
+
+# - - - - - General configuration
+## The number of processes in the pool of processes
+number_of_workers: 2
+## The directory with images
+input_pattern: /Users/jefflee/Desktop/*.tif
+## The directory where the big-fish output npz or quality control files will be stored
+## These directories will be created if they don't exist
+output_dir: /Users/jefflee/Desktop/bf_output
+output_qc_dir: /Users/jefflee/Desktop/bf_output_qc
+
+# - - - - - Bigfish configuration
+## Image voxel size and PSF parameters
+voxel_size_yx: 65
+voxel_size_z: 200
+ex: 570
+em: 610
+NA: 1.45
+RI: 1.45
+microscope: confocal
+## Background subtraction radius in pixels
+bg_radius: 5
+## The channels for which to run the processing (0-based)
+## Use [2, 3] format to quantify two smFISH channels 
+channels: [3] 
+## Bigfish single-spot detection parameters
+auto_threshold: True
+## Set up manual thresholds if not using auto-thresholding
+smFISH_ch1: 2
+smFISH_ch1_thresh: 50
+smFISH_ch2: 3
+smFISH_ch2_thresh: 30
+## Bigfish dense region decomposition and clustering parameters
+alpha: 0.5
+beta: 1
+bf_radius: 600 # in nanometer
+nb_min_spots: 12

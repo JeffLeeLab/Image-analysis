@@ -1,0 +1,349 @@
+---
+title: "smFISH PDF-mask summary"
+subtitle: "Neurite vs soma spot counts"
+author: "Bader project"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+    theme: cosmo
+    df-print: paged
+params:
+  summary_csv: "pdf_mask_summary.csv"
+  use_dummy_data: true
+  # 6-digit leading dates are ambiguous -- "dmy" reads 130323 as 13 Mar 2023
+  # (the convention in the existing lab filenames), "ymd" as 2013-03-23.
+  date_format: "dmy"
+editor: visual
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+```
+
+## What this does
+
+Reads the summary CSV written by `count_spots_in_pdf_mask.py`, which has just two
+columns:
+
+| column | meaning |
+|--------|---------|
+| `csv_filename` | name of the bigfish spot CSV, e.g. `260804_Camk2a_neurite_1_ch3_spots.csv` |
+| `nb_spots_within_mask` | spots falling inside the PDF mask |
+
+Everything else — date, gene, compartment — is encoded in the filename, so this
+document parses it back out, then pivots soma and neurite onto one row per
+sample to compute `neurite_soma_ratio`.
+
+::: callout-warning
+## Dummy filename convention — edit before real use
+
+This is a **scaffold**. The parsing below assumes:
+
+```
+{date}_{gene}_{compartment}_{replicate}_ch{N}_spots.csv
+040826_Camk2a_neurite_1_ch3_spots.csv
+```
+
+Your real filenames almost certainly differ, and the current pipeline does not
+encode compartment at all — `count_spots_in_pdf_mask.py` writes whatever the
+microscope file was called, plus `_ch{N}_spots.csv`. The three `case_when()`
+blocks in [Parse the filename] are the only place to change; each has an
+explicit `.default` marking unmatched files `NA` rather than guessing, and
+[Parsing QC] stops the render if anything comes back `NA`.
+
+Two decisions I could not make for you:
+
+-   **Date format.** A leading `130323` is ambiguous. `params$date_format`
+    defaults to `"dmy"` (13 Mar 2023), matching the convention in your existing
+    filenames like `130323_Dhc8-1-6-6_Gdi565_Rab11647_L2_1`. Set it to `"ymd"`
+    if that reading is wrong.
+-   **Gene list.** Hard-coded as `Camk2a`/`Bdnf`/`Actb` placeholders. Your real
+    gene tokens (`Gdi565`, `Rab11647`, …) look like gene+fluorophore pairs and
+    may need splitting into two columns.
+:::
+
+## Load
+
+With `params$use_dummy_data: true` this fabricates a small example table so the
+document always renders. Set it to `false` (or run
+`quarto render ... -P use_dummy_data:false`) to read the real CSV.
+
+```{r}
+#| label: load
+
+make_dummy_summary <- function() {
+  tidyr::expand_grid(
+    # DDMMYY, matching params$date_format: 040826 = 4 Aug 2026
+    date       = c("040826", "050826"),
+    gene       = c("Camk2a", "Bdnf", "Actb"),
+    compartment = c("soma", "neurite"),
+    replicate  = 1:3
+  ) |>
+    mutate(
+      csv_filename = str_glue(
+        "{date}_{gene}_{compartment}_{replicate}_ch3_spots.csv"
+      ) |> as.character(),
+      # soma-biased counts, with neurite deliberately lower
+      nb_spots_within_mask = if_else(
+        compartment == "soma",
+        as.integer(round(runif(n(), 400, 900))),
+        as.integer(round(runif(n(),  40, 300)))
+      )
+    ) |>
+    select(csv_filename, nb_spots_within_mask)
+}
+
+raw <- if (isTRUE(params$use_dummy_data)) {
+  set.seed(42)
+  make_dummy_summary()
+} else {
+  readr::read_csv(params$summary_csv, show_col_types = FALSE)
+}
+
+stopifnot(all(c("csv_filename", "nb_spots_within_mask") %in% names(raw)))
+
+glimpse(raw)
+```
+
+## Parse the filename
+
+Three `case_when()` blocks, one per parameter. `str_detect()` with word
+boundaries (`\\b`) rather than bare substrings, so a gene called `Actb` does not
+also match a file containing `Actbl2`.
+
+```{r}
+#| label: parse
+
+# Token delimiter: filename fields are separated by "_", and "_" is a word
+# character, so \\b does NOT mark a boundary inside 260804_Camk2a_soma_1.
+# Match on the delimiters explicitly instead.
+# The (?:...) wrapper matters: without it, tok("soma|cell_body") would parse as
+# "(^|_)soma" OR "cell_body(_|\\.|$)" and match in the wrong places.
+tok <- function(x) regex(str_c("(^|_)(?:", x, ")(_|\\.|$)"), ignore_case = TRUE)
+
+annotated <- raw |>
+  mutate(
+    # ---- date ------------------------------------------------------------
+    # 6-digit dates are ambiguous; params$date_format decides. 8 digits is
+    # unambiguous YYYYMMDD.
+    date_raw = str_extract(csv_filename, "^\\d+"),
+    date = case_when(
+      str_length(date_raw) == 8                              ~ lubridate::ymd(date_raw, quiet = TRUE),
+      str_length(date_raw) == 6 & params$date_format == "dmy" ~ lubridate::dmy(date_raw, quiet = TRUE),
+      str_length(date_raw) == 6 & params$date_format == "ymd" ~ lubridate::ymd(date_raw, quiet = TRUE),
+      .default = as.Date(NA)
+    ),
+
+    # ---- gene ------------------------------------------------------------
+    gene = case_when(
+      str_detect(csv_filename, tok("Camk2a")) ~ "Camk2a",
+      str_detect(csv_filename, tok("Bdnf"))   ~ "Bdnf",
+      str_detect(csv_filename, tok("Actb"))   ~ "Actb",
+      .default = NA_character_
+    ),
+
+    # ---- compartment -----------------------------------------------------
+    compartment = case_when(
+      str_detect(csv_filename, tok("neurite|axon|dendrite")) ~ "neurite",
+      str_detect(csv_filename, tok("soma|cell.?body"))       ~ "soma",
+      .default = NA_character_
+    ),
+
+    # ---- replicate and channel ------------------------------------------
+    replicate = str_extract(csv_filename, "_(\\d+)_ch\\d+_", group = 1),
+    channel   = str_extract(csv_filename, "_ch(\\d+)_",      group = 1)
+  ) |>
+  select(-date_raw) |>
+  relocate(date, gene, compartment, replicate, channel, .after = csv_filename)
+
+annotated
+```
+
+### Parsing QC
+
+This is a **hard stop, not a warning**. An `NA` gene does not merely drop a
+sample — it makes every unparsed file share the same `id_cols` group, and
+`values_fn = sum` in the pivot below then adds unrelated genes together into a
+single row. The result looks entirely plausible and is wrong. Better to fail.
+
+```{r}
+#| label: parse-qc
+#| error: true
+
+unparsed <- annotated |>
+  filter(if_any(c(date, gene, compartment), is.na))
+
+if (nrow(unparsed) > 0) {
+  print(unparsed |> select(csv_filename, date, gene, compartment), n = 20)
+  stop(
+    nrow(unparsed), " of ", nrow(annotated),
+    " filename(s) did not parse. Fix the case_when() blocks above before ",
+    "trusting anything below -- unparsed rows corrupt the pivot silently."
+  )
+}
+
+cat("All", nrow(annotated), "filenames parsed cleanly.\n")
+```
+
+## Pivot to one row per sample
+
+`pivot_wider()` needs to know what makes two rows *the same sample* — here
+date + gene + replicate — so the soma and neurite rows collapse together.
+
+`values_fn = sum` handles a sample that legitimately has more than one CSV per
+compartment (e.g. two channels quantified separately). Without it
+`pivot_wider()` returns list-columns and the ratio arithmetic breaks. But
+summing is only correct when you *meant* to pool those files, so the function
+reports every cell where it actually fired rather than pooling silently — if
+you did not expect it, your `id_cols` are too coarse.
+
+```{r}
+#| label: widen
+
+widen_by_compartment <- function(data,
+                                 id_cols = c(date, gene, replicate),
+                                 min_soma_count = 1) {
+
+  # surface any (sample x compartment) cell built from more than one file
+  pooled <- data |>
+    filter(!is.na(compartment)) |>
+    summarise(n_files = n(), .by = c({{ id_cols }}, compartment)) |>
+    filter(n_files > 1)
+
+  if (nrow(pooled) > 0) {
+    warning(
+      nrow(pooled), " cell(s) pooled from >1 file -- inspect with ",
+      "attr(wide, 'pooled_cells')"
+    )
+  }
+
+  pivoted <- data |>
+    filter(!is.na(compartment)) |>
+    pivot_wider(
+      id_cols     = {{ id_cols }},
+      names_from  = compartment,
+      values_from = nb_spots_within_mask,
+      names_glue  = "{compartment}_count",
+      values_fn   = sum,
+      values_fill = 0L
+    )
+
+  # tolerate a batch where one compartment is entirely absent
+  for (col in c("soma_count", "neurite_count")) {
+    if (!col %in% names(pivoted)) pivoted[[col]] <- NA_integer_
+  }
+
+  result <- pivoted |>
+    mutate(
+      total_count = soma_count + neurite_count,
+      # guard division by zero: a soma with no spots gives no meaningful ratio
+      neurite_soma_ratio = if_else(
+        soma_count >= min_soma_count,
+        neurite_count / soma_count,
+        NA_real_
+      ),
+      neurite_fraction = if_else(
+        total_count > 0,
+        neurite_count / total_count,
+        NA_real_
+      )
+    ) |>
+    relocate(soma_count, neurite_count, total_count, .after = replicate) |>
+    arrange(date, gene, replicate)
+
+  attr(result, "pooled_cells") <- pooled
+  result
+}
+
+wide <- widen_by_compartment(annotated)
+wide
+```
+
+## Results
+
+```{r}
+#| label: table
+
+if (requireNamespace("DT", quietly = TRUE)) {
+  wide |>
+    mutate(across(c(neurite_soma_ratio, neurite_fraction), \(x) round(x, 3))) |>
+    DT::datatable(
+      filter  = "top",
+      rownames = FALSE,
+      options = list(pageLength = 10, scrollX = TRUE)
+    )
+} else {
+  knitr::kable(wide, digits = 3)
+}
+```
+
+### Per-gene summary
+
+```{r}
+#| label: summarise
+
+wide |>
+  summarise(
+    n              = n(),
+    mean_ratio     = mean(neurite_soma_ratio, na.rm = TRUE),
+    sd_ratio       = sd(neurite_soma_ratio,   na.rm = TRUE),
+    median_ratio   = median(neurite_soma_ratio, na.rm = TRUE),
+    .by = gene
+  ) |>
+  arrange(desc(mean_ratio)) |>
+  knitr::kable(digits = 3)
+```
+
+### Ratio by gene
+
+```{r}
+#| label: fig-ratio
+#| fig-cap: "Neurite:soma spot-count ratio. Each point is one replicate."
+#| fig-width: 7
+#| fig-height: 4.5
+
+wide |>
+  filter(!is.na(neurite_soma_ratio)) |>
+  ggplot(aes(x = fct_reorder(gene, neurite_soma_ratio), y = neurite_soma_ratio)) +
+  geom_boxplot(outlier.shape = NA, width = 0.5, fill = "grey92") +
+  geom_jitter(aes(colour = factor(date)), width = 0.12, size = 2.5, alpha = 0.85) +
+  scale_colour_brewer(palette = "Dark2", name = "Date") +
+  labs(x = NULL, y = "Neurite / soma spot count") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.x = element_blank())
+```
+
+## Export
+
+```{r}
+#| label: export
+#| eval: false
+
+readr::write_csv(wide, "pdf_mask_summary_wide.csv")
+```
+
+------------------------------------------------------------------------
+
+::: callout-note
+## Rendering
+
+``` bash
+# dummy data (default)
+quarto render smFISH_pdf-mask_summary-report.qmd
+
+# real data
+quarto render smFISH_pdf-mask_summary-report.qmd \
+  -P use_dummy_data:false \
+  -P summary_csv:/path/to/pdf_mask_summary.csv
+```
+:::
