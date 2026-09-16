@@ -1,0 +1,13 @@
+[project]
+name = "zhiling-marko-hiv"
+version = "0.1.0"
+description = "HIV smFISH/IF image analysis"
+requires-python = ">=3.11"
+dependencies = [
+    "ipykernel>=7.3.0",
+    "jupyter>=1.1.1",
+    "matplotlib>=3.11.2",
+    "numpy>=2.4.6",
+    "scikit-image>=0.26.0",
+    "tifffile>=2026.3.3",
+]
