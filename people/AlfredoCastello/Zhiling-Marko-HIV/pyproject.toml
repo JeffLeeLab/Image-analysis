@@ -9,5 +9,6 @@ dependencies = [
     "matplotlib>=3.11.2",
     "numpy>=2.4.6",
     "scikit-image>=0.26.0",
+    "scipy>=1.17.1",
     "tifffile>=2026.3.3",
 ]

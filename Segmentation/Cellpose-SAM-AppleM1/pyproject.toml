@@ -1,0 +1,22 @@
+[project]
+name = "cellpose-sam-applem1"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "cellpose>=4",
+    "dinov3",
+    "ipykernel>=7.3.0",
+    "jupyterlab>=4.6.3",
+    "matplotlib>=3.11.2",
+    "numpy>=2.5.3",
+    "pandas>=3.0.5",
+    "scikit-image>=0.26.0",
+    "scipy>=1.18.1",
+    "tifffile>=2026.9.15",
+    "torch>=2.14.0",
+    "torchvision>=0.29.0",
+    "tqdm>=4.70.1",
+]
+
+[tool.uv.sources]
+dinov3 = { git = "https://github.com/facebookresearch/dinov3.git" }
