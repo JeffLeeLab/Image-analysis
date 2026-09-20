@@ -156,7 +156,8 @@ def qc_figure(raw_projection, input_8bit, mask, method, level, percentiles=CONTR
     """Four panels, all auto-contrasted for display: raw, 8-bit input, mask, overlay."""
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+    fig, axes = plt.subplots(2, 2, figsize=(11, 11))
+    axes = axes.ravel()
 
     vmin, vmax = contrast_limits(raw_projection, percentiles)
     axes[0].imshow(raw_projection, cmap="gray", vmin=vmin, vmax=vmax)

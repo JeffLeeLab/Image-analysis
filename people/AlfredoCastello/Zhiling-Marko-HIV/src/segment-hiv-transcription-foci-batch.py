@@ -47,7 +47,9 @@ def parse_args():
                         "Default: %(default)s")
     p.add_argument("--rolling-ball-radius", type=int, default=10)
     p.add_argument("--median-radius", type=int, default=2)
-    p.add_argument("--dpi", type=int, default=110, help="QC plot resolution (default: %(default)s)")
+    p.add_argument("--dpi", type=int, default=110,
+                   help="QC plot resolution; 110 gives a ~1175x1199 px, ~1 MB PNG "
+                        "(default: %(default)s)")
     return p.parse_args()
 
 
