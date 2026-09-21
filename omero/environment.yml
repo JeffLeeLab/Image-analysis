@@ -1,0 +1,12 @@
+# macOS Apple Silicon; Ice wheel targets Python 3.11.
+name: omero
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11
+  - pip
+  - ome::bftools=8.1.1
+  - pip:
+      - https://github.com/glencoesoftware/zeroc-ice-py-macos-universal2/releases/download/20240131/zeroc_ice-3.6.5-cp311-cp311-macosx_11_0_universal2.whl
+      - omero-py==5.23.0
