@@ -12,12 +12,19 @@ For each input image, writes to the output directory:
 
 Example:
   uv run python src/segment-hiv-transcription-foci-batch.py /Volumes/Jeff-exFAT/Marko_HIV/110723/MARF1/Dox \
-      -o /Volumes/Jeff-exFAT/Marko_HIV/110723/MARF1/Dox/foci_masks -m MaxEntropy
+      -o /Volumes/Jeff-exFAT/Marko_HIV/110723/MARF1/Dox/foci_masks -m MaxEntropy --workers 4
+
+Workers process separate images in parallel. Memory use grows with the worker count;
+start with 2-4 workers for large stacks. The default is sequential processing.
 """
 
 import argparse
 import csv
 import sys
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import nullcontext
+from itertools import repeat
+from multiprocessing import get_context
 from pathlib import Path
 
 import matplotlib
@@ -29,6 +36,13 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from foci_pipeline import METHOD_NAMES, Params, preprocess, qc_figure, segment  # noqa: E402
+
+
+def positive_int(value):
+    value = int(value)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return value
 
 
 def parse_args():
@@ -47,10 +61,32 @@ def parse_args():
                         "Default: %(default)s")
     p.add_argument("--rolling-ball-radius", type=int, default=10)
     p.add_argument("--median-radius", type=int, default=2)
+    p.add_argument("-j", "--workers", type=positive_int, default=1,
+                   help="number of images processed concurrently; each worker needs memory "
+                        "for a stack and QC plot (default: %(default)s)")
     p.add_argument("--dpi", type=int, default=110,
                    help="QC plot resolution; 110 gives a ~1175x1199 px, ~1 MB PNG "
                         "(default: %(default)s)")
     return p.parse_args()
+
+
+def process_image(path, params, output_dir, method, dpi):
+    """Write one image's outputs and return a small, serializable summary row."""
+    fig = None
+    try:
+        raw_projection, input_8bit = preprocess(path, params)
+        level, mask = segment(input_8bit, method)
+        tifffile.imwrite(output_dir / f"{path.stem}_focimask.tif",
+                         (mask * 255).astype(np.uint8))
+        fig = qc_figure(raw_projection, input_8bit, mask, method, level)
+        fig.savefig(output_dir / f"{path.stem}_focimask-qc.png", dpi=dpi,
+                    bbox_inches="tight")
+        return [path.name, params.mode, method, level, f"{100 * mask.mean():.4f}", ""]
+    except Exception as exc:  # one bad file should not stop the batch
+        return [path.name, params.mode, method, "", "", f"{type(exc).__name__}: {exc}"]
+    finally:
+        if fig is not None:
+            plt.close(fig)
 
 
 def main():
@@ -69,31 +105,31 @@ def main():
         sys.exit(f"no files matching {args.pattern!r} in {args.input_dir}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Files with the same stem would write to the same output, potentially concurrently.
+    if len({path.stem for path in paths}) != len(paths):
+        sys.exit("input files have duplicate stems; use a narrower --pattern to avoid output collisions")
+
+    workers = min(args.workers, len(paths))
+    print(f"Processing {len(paths)} images with {workers} worker(s)", flush=True)
+    pool = (ProcessPoolExecutor(max_workers=workers, mp_context=get_context("spawn"))
+            if workers > 1 else nullcontext())
+
     summary_path = args.output_dir / "focimask-summary.csv"
-    with open(summary_path, "w", newline="") as fh:
+    with pool as executor, open(summary_path, "w", newline="") as fh:
         writer = csv.writer(fh)
         writer.writerow(["file", "mode", "method", "threshold_level", "foreground_pct", "error"])
 
-        for i, path in enumerate(paths, 1):
-            base = path.stem
-            print(f"[{i}/{len(paths)}] {path.name}", flush=True)
-            try:
-                raw_projection, input_8bit = preprocess(path, params)
-                level, mask = segment(input_8bit, args.method)
-
-                tifffile.imwrite(args.output_dir / f"{base}_focimask.tif",
-                                 (mask * 255).astype(np.uint8))
-                fig = qc_figure(raw_projection, input_8bit, mask, args.method, level)
-                fig.savefig(args.output_dir / f"{base}_focimask-qc.png", dpi=args.dpi,
-                            bbox_inches="tight")  # or tight_layout clips the panel titles
-                plt.close(fig)  # figures are large; close or the run grows to GBs
-
-                foreground = 100 * mask.mean()
-                print(f"    level {level}, foreground {foreground:.2f}%", flush=True)
-                writer.writerow([path.name, args.mode, args.method, level, f"{foreground:.4f}", ""])
-            except Exception as exc:  # one bad file should not stop the batch
-                print(f"    FAILED: {type(exc).__name__}: {exc}", flush=True)
-                writer.writerow([path.name, args.mode, args.method, "", "", f"{type(exc).__name__}: {exc}"])
+        map_images = executor.map if executor is not None else map
+        rows = map_images(process_image, paths, repeat(params), repeat(args.output_dir),
+                          repeat(args.method), repeat(args.dpi))
+        # Only the parent writes the CSV; map preserves the sorted input order.
+        for i, row in enumerate(rows, 1):
+            print(f"[{i}/{len(paths)}] {row[0]}", flush=True)
+            if row[-1]:
+                print(f"    FAILED: {row[-1]}", flush=True)
+            else:
+                print(f"    level {row[3]}, foreground {float(row[4]):.2f}%", flush=True)
+            writer.writerow(row)
             fh.flush()
 
     print(f"\ndone -> {args.output_dir}\nsummary: {summary_path}")
