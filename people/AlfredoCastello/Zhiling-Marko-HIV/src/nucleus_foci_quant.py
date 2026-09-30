@@ -1,4 +1,4 @@
-"""Per-nucleus foci count and FISH intensities.
+"""Per-nucleus foci count and FISH intensities, normalised to Mock nuclei.
 
 Used by `measure-foci-nucleus-fish-intensities.ipynb` (section 2). For one image, three
 2D inputs of the same shape are matched by basename:
@@ -12,29 +12,43 @@ Rules:
   - each whole focus goes to the nucleus it overlaps most (any overlap counts); ties go
     to the lowest nucleus id. Majority is decided among all nuclei, so a focus won by an
     excluded border nucleus is dropped, not handed to a neighbour
-  - focus area and intensity are those of the whole blob, including pixels outside the
-    nucleus (flagged by `foci-extends-outside-nucleus`)
+  - `foci_inclusion` sets which assigned foci are counted:
+      "encapsulated" (default): only foci whose every pixel lies inside the assigned
+        nucleus; foci reaching outside it (or into another nucleus) are discarded
+      "overlapping": every assigned focus, including those reaching outside the nucleus
+        (flagged by `foci-extends-outside-nucleus`)
+  - focus area and intensity are always those of the whole blob
   - foci that overlap no nucleus are ignored
   - foci smaller than `min_foci_area` pixels are removed before assignment
+  - the per-focus table has one row per counted focus plus one row (`has-foci` False, foci
+    fields empty) per kept nucleus without foci; the per-nucleus table is summarised from it
+
+Across the dataset, conditions are parsed from the basename
+(`{replicate}_{rbp}_{induction}_{hiv-infection}_{field}`), and every raw FISH integrated
+intensity is normalised as raw - area x background-per-pixel, where background-per-pixel
+comes from the Mock nuclei of the same `group_by` group (see `mock_baselines`).
 """
 
 import math
+import re
 
 import numpy as np
 from scipy import ndimage
 
-FOCI_COLUMNS = [
-    "image-filename-basename", "nucleus-id", "nucleus-area", "nucleus-fish-integrated-intensity",
-    "foci-index", "foci-area", "foci-fish-integrated-intensity", "foci-max-intensity",
-    "foci-centroid-x", "foci-centroid-y", "foci-extends-outside-nucleus",
-]
-NUCLEUS_COLUMNS = [
-    "image-filename-basename", "nucleus-id", "nucleus-area", "nucleus-fish-integrated-intensity",
-    "foci-count", "total-foci-area", "total-foci-fish-integrated-intensity",
-    "mean-fish-integrated-intensity-per-foci",
-]
+CONDITION_COLUMNS = ["replicate", "rbp", "induction", "hiv-infection", "field"]
+CONDITION_VALUES = {
+    "rbp": ("CPEB4", "GFP", "MARF1"),
+    "induction": ("Dox", "NoDox"),
+    "hiv-infection": ("INF-24hpi", "INF-48hpi", "Mock"),
+}
+BASENAME_PATTERN = re.compile(
+    r"(?P<replicate>\d{6})_(?P<rbp>[^_]+)_(?P<induction>[^_]+)_(?P<infection>[^_]+)_(?P<field>\d+)")
+MOCK = "Mock"
+BASELINE_GROUPABLE = ("replicate", "rbp", "induction")
+BASELINE_STATISTICS = ("median", "mean", "pooled-mean")
 
 FOUR_CONNECTED = ndimage.generate_binary_structure(2, 1)
+FOCI_INCLUSIONS = ("encapsulated", "overlapping")
 
 
 def border_labels(labels):
@@ -43,14 +57,20 @@ def border_labels(labels):
     return set(np.unique(edges[edges > 0]).tolist())
 
 
-def measure_image(basename, labels, foci_mask, intensity, min_foci_area=0):
-    """Returns (foci_rows, nucleus_rows, messages, foci_lab, assigned).
+def measure_image(basename, labels, foci_mask, intensity, min_foci_area=0,
+                  foci_inclusion="encapsulated"):
+    """Returns (rows, messages, foci_lab, assigned).
 
-    `messages` are (level, text) pairs for the log. `foci_lab` is the 4-connected foci
+    `rows` has one row per counted focus plus one row per kept nucleus without foci
+    (`has-foci` False; foci fields NaN/None), with raw intensities only. `messages` are (level, text) pairs for the log. `foci_lab` is the 4-connected foci
     label image and `assigned` maps each foci_lab id to its kept nucleus id or to None
-    (too small / outside nuclei / on a border nucleus); both are for the QC figure.
-    Foci with area < `min_foci_area` px are removed (0 or 1 keeps every focus).
+    (too small / outside nuclei / on a border nucleus / not encapsulated); both are for
+    the QC figure. Foci with area < `min_foci_area` px are removed (0 or 1 keeps every
+    focus). `foci_inclusion` is "encapsulated" (keep only foci lying wholly inside their
+    nucleus) or "overlapping" (also keep foci that reach outside it).
     """
+    if foci_inclusion not in FOCI_INCLUSIONS:
+        raise ValueError(f"foci_inclusion {foci_inclusion!r} is not one of {FOCI_INCLUSIONS}")
     messages = []
     if labels.ndim != 2 or foci_mask.shape != labels.shape or intensity.shape != labels.shape:
         raise ValueError(f"shape mismatch: labels {labels.shape}, foci {foci_mask.shape}, "
@@ -90,7 +110,7 @@ def measure_image(basename, labels, foci_mask, intensity, min_foci_area=0):
         overlaps.setdefault(f, []).append((c, n))
 
     assigned = {}  # focus -> kept nucleus id, or None
-    n_small = n_outside = n_on_border = 0
+    n_small = n_outside = n_on_border = n_not_encapsulated = 0
     for f in range(1, n_foci + 1):
         if foci_area[f] < min_foci_area:
             assigned[f] = None
@@ -104,71 +124,229 @@ def measure_image(basename, labels, foci_mask, intensity, min_foci_area=0):
         best = max(c for c, _ in cands)
         winners = sorted(n for c, n in cands if c == best)
         nucleus = winners[0]
+        overlap = next(c for c, n in cands if n == nucleus)
+        drop_unencapsulated = (foci_inclusion == "encapsulated" and nucleus not in excluded
+                               and overlap < foci_area[f])
         if len(cands) > 1:
             detail = ", ".join(f"nucleus {n}: {c} px" for c, n in sorted(cands, key=lambda x: x[1]))
             messages.append(("OUTLIER", f"focus at (x={foci_cx[f] / foci_area[f]:.0f}, "
                                         f"y={foci_cy[f] / foci_area[f]:.0f}) overlaps "
                                         f"{len(cands)} nuclei ({detail}) -> nucleus {nucleus}"
-                                        + (" (tie, lowest id)" if len(winners) > 1 else "")))
+                                        + (" (tie, lowest id)" if len(winners) > 1 else "")
+                                        + (" (dropped: not encapsulated)" if drop_unencapsulated else "")))
         if nucleus in excluded:
             assigned[f] = None
             n_on_border += 1
+        elif drop_unencapsulated:
+            assigned[f] = None
+            n_not_encapsulated += 1
         else:
             assigned[f] = nucleus
 
     # --- rows -----------------------------------------------------------------------------
-    foci_rows = []
-    per_nucleus = {n: [] for n in kept}
+    def nucleus_fields(n):
+        return {
+            "image-filename-basename": basename,
+            "nucleus-id": n,
+            "nucleus-area": int(nucleus_area[n]),
+            "nucleus-fish-raw-integrated-intensity": float(nucleus_intensity[n]),
+        }
+
+    rows = []
+    with_foci = set()
     index = 0
     for f in range(1, n_foci + 1):
         nucleus = assigned[f]
         if nucleus is None:
             continue
         index += 1
+        with_foci.add(nucleus)
         overlap = next(c for c, n in overlaps[f] if n == nucleus)
-        row = {
-            "image-filename-basename": basename,
-            "nucleus-id": nucleus,
-            "nucleus-area": int(nucleus_area[nucleus]),
-            "nucleus-fish-integrated-intensity": float(nucleus_intensity[nucleus]),
+        rows.append({
+            **nucleus_fields(nucleus),
+            "has-foci": True,
             "foci-index": index,
             "foci-area": int(foci_area[f]),
-            "foci-fish-integrated-intensity": float(foci_intensity[f]),
+            "foci-fish-raw-integrated-intensity": float(foci_intensity[f]),
             "foci-max-intensity": float(foci_max[f - 1]),
             "foci-centroid-x": float(foci_cx[f] / foci_area[f]),
             "foci-centroid-y": float(foci_cy[f] / foci_area[f]),
             "foci-extends-outside-nucleus": bool(overlap < foci_area[f]),
-        }
-        foci_rows.append(row)
-        per_nucleus[nucleus].append(row)
-
-    nucleus_rows = []
-    for n in kept:
-        foci = per_nucleus[n]
-        total = sum((r["foci-fish-integrated-intensity"] for r in foci), 0.0)
-        nucleus_rows.append({
-            "image-filename-basename": basename,
-            "nucleus-id": n,
-            "nucleus-area": int(nucleus_area[n]),
-            "nucleus-fish-integrated-intensity": float(nucleus_intensity[n]),
-            "foci-count": len(foci),
-            "total-foci-area": sum(r["foci-area"] for r in foci),
-            "total-foci-fish-integrated-intensity": total,
-            "mean-fish-integrated-intensity-per-foci": total / len(foci) if foci else math.nan,
         })
+    for n in kept:
+        if n not in with_foci:
+            rows.append({
+                **nucleus_fields(n),
+                "has-foci": False,
+                "foci-index": None,
+                "foci-area": math.nan,
+                "foci-fish-raw-integrated-intensity": math.nan,
+                "foci-max-intensity": math.nan,
+                "foci-centroid-x": math.nan,
+                "foci-centroid-y": math.nan,
+                "foci-extends-outside-nucleus": None,
+            })
 
     messages.append(("INFO", f"{len(nucleus_ids)} nuclei ({len(excluded)} on border, {len(kept)} kept); "
-                             f"{n_foci} foci ({len(foci_rows)} counted, {n_small} below {min_foci_area} px, "
+                             f"{n_foci} foci ({index} counted, {n_small} below {min_foci_area} px, "
                              f"{n_on_border} on border nuclei, "
-                             f"{n_outside} outside nuclei)"))
-    return foci_rows, nucleus_rows, messages, foci_lab, assigned
+                             f"{n_outside} outside nuclei"
+                             + (f", {n_not_encapsulated} not encapsulated"
+                                if foci_inclusion == "encapsulated" else "") + ")"))
+    return rows, messages, foci_lab, assigned
+
+
+# --- dataset level: conditions, Mock baselines, normalisation, per-nucleus summary ------------
+def baseline_column(statistic):
+    return f"mock-nuclear-fish-background-per-pixel-{statistic}"
+
+
+def foci_columns(statistic):
+    return [
+        "image-filename-basename", *CONDITION_COLUMNS, "nucleus-id", "nucleus-area",
+        baseline_column(statistic),
+        "nucleus-fish-raw-integrated-intensity", "nucleus-fish-normalised-integrated-intensity",
+        "has-foci", "foci-index", "foci-area",
+        "foci-fish-raw-integrated-intensity", "foci-fish-normalised-integrated-intensity",
+        "foci-max-intensity", "foci-centroid-x", "foci-centroid-y", "foci-extends-outside-nucleus",
+    ]
+
+
+def nucleus_columns(statistic):
+    return [
+        "image-filename-basename", *CONDITION_COLUMNS, "nucleus-id", "nucleus-area",
+        baseline_column(statistic),
+        "nucleus-fish-raw-integrated-intensity", "nucleus-fish-normalised-integrated-intensity",
+        "foci-count", "total-foci-area",
+        "total-foci-fish-raw-integrated-intensity", "total-foci-fish-normalised-integrated-intensity",
+        "mean-fish-raw-integrated-intensity-per-foci", "mean-fish-normalised-integrated-intensity-per-foci",
+    ]
+
+
+def baseline_columns(group_by):
+    return [*group_by, "n-mock-nuclei", "n-mock-images", "median", "mean", "pooled-mean", "sd",
+            "statistic-used"]
+
+
+def parse_basename(basename):
+    """{replicate, rbp, induction, hiv-infection, field} from e.g. 080623_CPEB4_Dox_INF-24hpi_001.
+
+    All values stay strings (replicate and field keep their leading zeros). Raises
+    ValueError if the name does not match or a value is not in CONDITION_VALUES.
+    """
+    m = BASENAME_PATTERN.fullmatch(basename)
+    if not m:
+        raise ValueError(f"basename {basename!r} does not match "
+                         f"{{replicate}}_{{rbp}}_{{induction}}_{{hiv-infection}}_{{field}}, "
+                         f"e.g. 080623_CPEB4_Dox_INF-24hpi_001")
+    parsed = {"replicate": m["replicate"], "rbp": m["rbp"], "induction": m["induction"],
+              "hiv-infection": m["infection"], "field": m["field"]}
+    bad = [f"{k} {parsed[k]!r} (expected {' / '.join(v)})"
+           for k, v in CONDITION_VALUES.items() if parsed[k] not in v]
+    if bad:
+        raise ValueError(f"basename {basename!r}: unknown {'; '.join(bad)}")
+    return parsed
+
+
+def _nuclei(rows):
+    """{(image, nucleus id): [rows]} in first-seen order; nucleus columns repeat on each row."""
+    groups = {}
+    for r in rows:
+        groups.setdefault((r["image-filename-basename"], r["nucleus-id"]), []).append(r)
+    return groups
+
+
+def mock_baselines(rows, group_by, statistic):
+    """{group key: baseline-table row} from the Mock nuclei of each `group_by` group.
+
+    A group key is the tuple of the row's `group_by` values. Per Mock nucleus, density =
+    raw integrated intensity / area (per pixel of the sum projection). Each group gets the
+    median, mean and sample SD of the densities and the pooled mean sum(intensity) /
+    sum(area); `statistic` names the one used for normalisation. Every group present in
+    `rows` must have Mock nuclei, otherwise ValueError.
+    """
+    unknown = [c for c in group_by if c not in BASELINE_GROUPABLE]
+    if unknown:
+        raise ValueError(f"BASELINE_GROUP_BY {unknown} not in {list(BASELINE_GROUPABLE)}")
+    if statistic not in BASELINE_STATISTICS:
+        raise ValueError(f"BASELINE_STATISTIC {statistic!r} is not one of {BASELINE_STATISTICS}")
+    nuclei = [rs[0] for rs in _nuclei(rows).values()]
+    mock = {}
+    for r in nuclei:
+        if r["hiv-infection"] == MOCK:
+            mock.setdefault(tuple(r[c] for c in group_by), []).append(r)
+    missing = sorted({tuple(r[c] for c in group_by) for r in nuclei} - mock.keys())
+    if missing:
+        raise ValueError("no Mock nuclei for " + "; ".join(
+            ", ".join(f"{c}={v}" for c, v in zip(group_by, key)) for key in missing)
+            + f" (BASELINE_GROUP_BY = {list(group_by)})")
+
+    baselines = {}
+    for key, rs in sorted(mock.items()):
+        intensity = np.array([r["nucleus-fish-raw-integrated-intensity"] for r in rs])
+        area = np.array([r["nucleus-area"] for r in rs], dtype=np.float64)
+        density = intensity / area
+        baselines[key] = {
+            **dict(zip(group_by, key)),
+            "n-mock-nuclei": len(rs),
+            "n-mock-images": len({r["image-filename-basename"] for r in rs}),
+            "median": float(np.median(density)),
+            "mean": float(density.mean()),
+            "pooled-mean": float(intensity.sum() / area.sum()),
+            "sd": float(density.std(ddof=1)) if len(rs) > 1 else math.nan,
+            "statistic-used": statistic,
+        }
+    return baselines
+
+
+def normalise(rows, baselines, group_by, statistic):
+    """Copies of `rows` with the baseline column and normalised = raw - area x baseline.
+
+    Negative values are kept. Rows without foci keep NaN foci intensities.
+    """
+    column = baseline_column(statistic)
+    out = []
+    for r in rows:
+        b = baselines[tuple(r[c] for c in group_by)][statistic]
+        out.append({
+            **r,
+            column: b,
+            "nucleus-fish-normalised-integrated-intensity":
+                r["nucleus-fish-raw-integrated-intensity"] - r["nucleus-area"] * b,
+            "foci-fish-normalised-integrated-intensity":
+                r["foci-fish-raw-integrated-intensity"] - r["foci-area"] * b,
+        })
+    return out
+
+
+def summarise_per_nucleus(rows, statistic):
+    """One row per nucleus from the normalised per-focus rows (nuclei without foci: count 0,
+    totals 0, means NaN)."""
+    column = baseline_column(statistic)
+    carried = ["image-filename-basename", *CONDITION_COLUMNS, "nucleus-id", "nucleus-area", column,
+               "nucleus-fish-raw-integrated-intensity", "nucleus-fish-normalised-integrated-intensity"]
+    out = []
+    for rs in _nuclei(rows).values():
+        foci = [r for r in rs if r["has-foci"]]
+        raw = sum((r["foci-fish-raw-integrated-intensity"] for r in foci), 0.0)
+        norm = sum((r["foci-fish-normalised-integrated-intensity"] for r in foci), 0.0)
+        out.append({
+            **{k: rs[0][k] for k in carried},
+            "foci-count": len(foci),
+            "total-foci-area": sum(r["foci-area"] for r in foci),
+            "total-foci-fish-raw-integrated-intensity": raw,
+            "total-foci-fish-normalised-integrated-intensity": norm,
+            "mean-fish-raw-integrated-intensity-per-foci": raw / len(foci) if foci else math.nan,
+            "mean-fish-normalised-integrated-intensity-per-foci": norm / len(foci) if foci else math.nan,
+        })
+    return out
 
 
 def qc_figure(basename, labels, intensity, foci_lab, assigned, percentiles=(0.5, 99.9)):
     """Sum projection with nucleus and foci outlines at 1:1 pixel scale.
 
     Kept nuclei cyan with their id, border nuclei grey, counted foci magenta, ignored
-    foci yellow. Uses the Figure API (not pyplot) so it is safe to call from threads.
+    foci yellow (too small, on a border nucleus, outside nuclei or not encapsulated). Uses the Figure API (not pyplot) so it is safe to call from threads.
     """
     from matplotlib.figure import Figure
     from skimage.segmentation import find_boundaries

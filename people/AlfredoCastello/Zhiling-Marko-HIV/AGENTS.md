@@ -11,6 +11,6 @@ This subproject uses `uv` and its local `.venv` for Python dependencies.
 Do not analyse these images further. Their array shape does not match the other images in the dataset:
 
 - `160323_GFP_Dox_INF-48hpi_010.tif`
-- `160323_MARF1_NoDox_INF-48hpi_006.tif`
+- `160323_MARF1_NoDox_INF-24hpi_006.tif`
 
 Skip them in batch runs, notebooks and downstream quantification, and leave their rows out of combined results.
