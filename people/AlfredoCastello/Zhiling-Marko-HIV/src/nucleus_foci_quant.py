@@ -26,7 +26,9 @@ Rules:
 Across the dataset, conditions are parsed from the basename
 (`{replicate}_{rbp}_{induction}_{hiv-infection}_{field}`), and every raw FISH integrated
 intensity is normalised as raw - area x background-per-pixel, where background-per-pixel
-comes from the Mock nuclei of the same `group_by` group (see `mock_baselines`).
+comes from the Mock nuclei of the same `group_by` group (see `mock_baselines`). Detected
+foci are then flagged `foci-counted` by the Mock foci filter (see `apply_mock_foci_filter`),
+and only counted foci enter the per-nucleus counts and totals.
 """
 
 import math
@@ -46,6 +48,8 @@ BASENAME_PATTERN = re.compile(
 MOCK = "Mock"
 BASELINE_GROUPABLE = ("replicate", "rbp", "induction")
 BASELINE_STATISTICS = ("median", "mean", "pooled-mean")
+MOCK_FOCI_FILTERS = ("cutoff", "keep", "drop")
+INFECTION_COLOURS = {"Mock": "#8c8c8c", "INF-24hpi": "#2a78d6", "INF-48hpi": "#eb6834"}
 
 FOUR_CONNECTED = ndimage.generate_binary_structure(2, 1)
 FOCI_INCLUSIONS = ("encapsulated", "overlapping")
@@ -201,23 +205,31 @@ def baseline_column(statistic):
     return f"mock-nuclear-fish-background-per-pixel-{statistic}"
 
 
-def foci_columns(statistic):
+def cutoff_column(percentile):
+    return f"mock-foci-cutoff-p{percentile:g}-normalised-integrated-intensity"
+
+
+def foci_columns(statistic, cutoff_percentile=None):
+    """`cutoff_percentile` adds the cutoff column (Mock foci filter "cutoff" only)."""
+    cutoff = [cutoff_column(cutoff_percentile)] if cutoff_percentile is not None else []
     return [
         "image-filename-basename", *CONDITION_COLUMNS, "nucleus-id", "nucleus-area",
         baseline_column(statistic),
         "nucleus-fish-raw-integrated-intensity", "nucleus-fish-normalised-integrated-intensity",
         "has-foci", "foci-index", "foci-area",
         "foci-fish-raw-integrated-intensity", "foci-fish-normalised-integrated-intensity",
+        *cutoff, "foci-counted",
         "foci-max-intensity", "foci-centroid-x", "foci-centroid-y", "foci-extends-outside-nucleus",
     ]
 
 
-def nucleus_columns(statistic):
+def nucleus_columns(statistic, cutoff_percentile=None):
+    cutoff = [cutoff_column(cutoff_percentile)] if cutoff_percentile is not None else []
     return [
         "image-filename-basename", *CONDITION_COLUMNS, "nucleus-id", "nucleus-area",
-        baseline_column(statistic),
+        baseline_column(statistic), *cutoff,
         "nucleus-fish-raw-integrated-intensity", "nucleus-fish-normalised-integrated-intensity",
-        "foci-count", "total-foci-area",
+        "foci-detected-count", "foci-count", "total-foci-area",
         "total-foci-fish-raw-integrated-intensity", "total-foci-fish-normalised-integrated-intensity",
         "mean-fish-raw-integrated-intensity-per-foci", "mean-fish-normalised-integrated-intensity-per-foci",
     ]
@@ -226,6 +238,12 @@ def nucleus_columns(statistic):
 def baseline_columns(group_by):
     return [*group_by, "n-mock-nuclei", "n-mock-images", "median", "mean", "pooled-mean", "sd",
             "statistic-used"]
+
+
+def foci_filter_columns(group_by):
+    return [*group_by, "mock-foci-filter", "percentile", "cutoff", "n-mock-nuclei",
+            "n-mock-foci-detected", "n-mock-foci-counted", "mock-counted-foci-per-nucleus",
+            "n-foci-detected", "n-foci-counted"]
 
 
 def parse_basename(basename):
@@ -319,19 +337,99 @@ def normalise(rows, baselines, group_by, statistic):
     return out
 
 
-def summarise_per_nucleus(rows, statistic):
-    """One row per nucleus from the normalised per-focus rows (nuclei without foci: count 0,
-    totals 0, means NaN)."""
+def apply_mock_foci_filter(rows, group_by, mode, percentile):
+    """Returns (copies of `rows` with `foci-counted`, {group key: filter-table row}).
+
+    Run on normalised rows. `mode`:
+      "cutoff": per `group_by` group, cutoff = `percentile` of the normalised integrated
+                intensity of the foci detected in Mock nuclei; in every condition a focus
+                is counted only if its normalised integrated intensity > cutoff. Rows get
+                the cutoff column. A group with Mock nuclei but no Mock foci gets no cutoff
+                (NaN) and all its foci are counted
+      "keep":   every detected focus is counted
+      "drop":   foci in Mock nuclei are not counted; all others are
+    Rows without foci get `foci-counted` None. Every group must have Mock nuclei,
+    otherwise ValueError.
+    """
+    unknown = [c for c in group_by if c not in BASELINE_GROUPABLE]
+    if unknown:
+        raise ValueError(f"FOCI_CUTOFF_GROUP_BY {unknown} not in {list(BASELINE_GROUPABLE)}")
+    if mode not in MOCK_FOCI_FILTERS:
+        raise ValueError(f"MOCK_FOCI_FILTER {mode!r} is not one of {MOCK_FOCI_FILTERS}")
+    if mode == "cutoff" and not 0 <= percentile <= 100:
+        raise ValueError(f"MOCK_FOCI_CUTOFF_PERCENTILE {percentile} is not within 0-100")
+
+    def key(r):
+        return tuple(r[c] for c in group_by)
+
+    mock_nuclei, mock_values = {}, {}
+    for r in rows:
+        mock_nuclei.setdefault(key(r), set())
+        if r["hiv-infection"] == MOCK:
+            mock_nuclei[key(r)].add((r["image-filename-basename"], r["nucleus-id"]))
+            if r["has-foci"]:
+                mock_values.setdefault(key(r), []).append(r["foci-fish-normalised-integrated-intensity"])
+    missing = sorted(k for k, nuclei in mock_nuclei.items() if not nuclei)
+    if missing:
+        raise ValueError("no Mock nuclei for " + "; ".join(
+            ", ".join(f"{c}={v}" for c, v in zip(group_by, k)) for k in missing)
+            + f" (FOCI_CUTOFF_GROUP_BY = {list(group_by)})")
+    cutoffs = {k: (float(np.percentile(mock_values[k], percentile))
+                   if mode == "cutoff" and k in mock_values else math.nan)
+               for k in mock_nuclei}
+
+    out = []
+    for r in rows:
+        r = dict(r)
+        cutoff = cutoffs[key(r)]
+        if mode == "cutoff":
+            r[cutoff_column(percentile)] = cutoff
+        if not r["has-foci"]:
+            r["foci-counted"] = None
+        elif mode == "keep":
+            r["foci-counted"] = True
+        elif mode == "drop":
+            r["foci-counted"] = r["hiv-infection"] != MOCK
+        else:
+            r["foci-counted"] = math.isnan(cutoff) or r["foci-fish-normalised-integrated-intensity"] > cutoff
+        out.append(r)
+
+    table = {}
+    for k in sorted(mock_nuclei):
+        foci = [r for r in out if key(r) == k and r["has-foci"]]
+        mock_foci = [r for r in foci if r["hiv-infection"] == MOCK]
+        n_mock_counted = sum(r["foci-counted"] for r in mock_foci)
+        table[k] = {
+            **dict(zip(group_by, k)),
+            "mock-foci-filter": mode,
+            "percentile": percentile if mode == "cutoff" else math.nan,
+            "cutoff": cutoffs[k],
+            "n-mock-nuclei": len(mock_nuclei[k]),
+            "n-mock-foci-detected": len(mock_foci),
+            "n-mock-foci-counted": n_mock_counted,
+            "mock-counted-foci-per-nucleus": n_mock_counted / len(mock_nuclei[k]),
+            "n-foci-detected": len(foci),
+            "n-foci-counted": sum(r["foci-counted"] for r in foci),
+        }
+    return out, table
+
+
+def summarise_per_nucleus(rows, statistic, cutoff_percentile=None):
+    """One row per nucleus from the normalised, filtered per-focus rows. Counts, totals and
+    means use counted foci only (none counted: count 0, totals 0, means NaN)."""
     column = baseline_column(statistic)
+    cutoff = [cutoff_column(cutoff_percentile)] if cutoff_percentile is not None else []
     carried = ["image-filename-basename", *CONDITION_COLUMNS, "nucleus-id", "nucleus-area", column,
-               "nucleus-fish-raw-integrated-intensity", "nucleus-fish-normalised-integrated-intensity"]
+               *cutoff, "nucleus-fish-raw-integrated-intensity",
+               "nucleus-fish-normalised-integrated-intensity"]
     out = []
     for rs in _nuclei(rows).values():
-        foci = [r for r in rs if r["has-foci"]]
+        foci = [r for r in rs if r["has-foci"] and r["foci-counted"]]
         raw = sum((r["foci-fish-raw-integrated-intensity"] for r in foci), 0.0)
         norm = sum((r["foci-fish-normalised-integrated-intensity"] for r in foci), 0.0)
         out.append({
             **{k: rs[0][k] for k in carried},
+            "foci-detected-count": sum(bool(r["has-foci"]) for r in rs),
             "foci-count": len(foci),
             "total-foci-area": sum(r["foci-area"] for r in foci),
             "total-foci-fish-raw-integrated-intensity": raw,
@@ -340,6 +438,59 @@ def summarise_per_nucleus(rows, statistic):
             "mean-fish-normalised-integrated-intensity-per-foci": norm / len(foci) if foci else math.nan,
         })
     return out
+
+
+def foci_intensity_figure(rows, filter_table, group_by, title=""):
+    """Distribution of focus normalised integrated intensity, one panel per filter group.
+
+    Every detected focus (counted or not), one step histogram per `hiv-infection`, each
+    scaled to its own total so conditions with very different foci numbers compare. x is
+    log10, so foci with normalised intensity <= 0 are left out and counted in the legend.
+    The cutoff, when there is one, is a dashed line. Figure API, safe from threads.
+    """
+    from matplotlib.figure import Figure
+
+    keys = list(filter_table)
+    foci = [r for r in rows if r["has-foci"]]
+    positive = [r["foci-fish-normalised-integrated-intensity"] for r in foci
+                if r["foci-fish-normalised-integrated-intensity"] > 0]
+    lo, hi = (np.log10(min(positive)), np.log10(max(positive))) if positive else (0.0, 1.0)
+    bins = np.linspace(lo, hi if hi > lo else lo + 1, 61)
+
+    ncols = min(3, len(keys)) or 1
+    nrows = max(1, math.ceil(len(keys) / ncols))
+    fig = Figure(figsize=(4.2 * ncols, 3.2 * nrows + 0.6), layout="constrained")
+    axes = fig.subplots(nrows, ncols, squeeze=False, sharex=True)
+    for ax in axes.flat[len(keys):]:
+        ax.set_visible(False)
+    for ax, k in zip(axes.flat, keys):
+        group = [r for r in foci if tuple(r[c] for c in group_by) == k]
+        for infection, colour in INFECTION_COLOURS.items():  # Mock first, under the infected lines
+            values = np.array([r["foci-fish-normalised-integrated-intensity"]
+                               for r in group if r["hiv-infection"] == infection])
+            if not len(values):
+                continue
+            pos = values[values > 0]
+            weights = np.full(len(pos), 1 / len(values))
+            ax.hist(np.log10(pos), bins=bins, weights=weights, histtype="step", linewidth=2,
+                    color=colour,
+                    label=f"{infection} (n={len(values)}"
+                          + (f", {len(values) - len(pos)} <= 0" if len(pos) < len(values) else "") + ")")
+        cutoff = filter_table[k]["cutoff"]
+        if not math.isnan(cutoff) and cutoff > 0:
+            ax.axvline(np.log10(cutoff), color="#333333", linestyle="--", linewidth=1.5,
+                       label=f"cutoff p{filter_table[k]['percentile']:g} = {cutoff:.3g}")
+        ax.set_title(", ".join(f"{c}={v}" for c, v in zip(group_by, k)) or "all", fontsize=10)
+        ax.set_xlabel("log10 focus normalised integrated intensity", fontsize=9)
+        ax.set_ylabel("fraction of foci", fontsize=9)
+        ax.tick_params(labelsize=8)
+        ax.grid(alpha=0.25, linewidth=0.5)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        ax.legend(fontsize=7, frameon=False, loc="upper right")
+    if title:
+        fig.suptitle(title, fontsize=11)
+    return fig
 
 
 def qc_figure(basename, labels, intensity, foci_lab, assigned, percentiles=(0.5, 99.9)):
