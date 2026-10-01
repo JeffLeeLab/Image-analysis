@@ -28,7 +28,8 @@ Across the dataset, conditions are parsed from the basename
 intensity is normalised as raw - area x background-per-pixel, where background-per-pixel
 comes from the Mock nuclei of the same `group_by` group (see `mock_baselines`). Detected
 foci are then flagged `foci-counted` by the Mock foci filter (see `apply_mock_foci_filter`),
-and only counted foci enter the per-nucleus counts and totals.
+and only counted foci enter the per-nucleus counts and totals. Optionally, normalised
+intensities are also scaled per replicate to a reference condition (see `reference_factors`).
 """
 
 import math
@@ -49,6 +50,12 @@ MOCK = "Mock"
 BASELINE_GROUPABLE = ("replicate", "rbp", "induction")
 BASELINE_STATISTICS = ("median", "mean", "pooled-mean")
 MOCK_FOCI_FILTERS = ("cutoff", "keep", "drop")
+REFERENCE_SCALED = {  # table -> normalised intensity columns scaled to the reference condition
+    "foci": ["nucleus-fish-normalised-integrated-intensity", "foci-fish-normalised-integrated-intensity"],
+    "nucleus": ["nucleus-fish-normalised-integrated-intensity",
+                "total-foci-fish-normalised-integrated-intensity",
+                "mean-fish-normalised-integrated-intensity-per-foci"],
+}
 INFECTION_COLOURS = {"Mock": "#8c8c8c", "INF-24hpi": "#2a78d6", "INF-48hpi": "#eb6834"}
 
 FOUR_CONNECTED = ndimage.generate_binary_structure(2, 1)
@@ -209,10 +216,23 @@ def cutoff_column(percentile):
     return f"mock-foci-cutoff-p{percentile:g}-normalised-integrated-intensity"
 
 
-def foci_columns(statistic, cutoff_percentile=None):
-    """`cutoff_percentile` adds the cutoff column (Mock foci filter "cutoff" only)."""
+def relative_column(column):
+    return f"{column}-relative-to-reference"
+
+
+def _with_relative(columns, table, relative):
+    """Each reference-scaled column followed by its relative column, if `relative`."""
+    if not relative:
+        return columns
+    return [c for col in columns
+            for c in ([col, relative_column(col)] if col in REFERENCE_SCALED[table] else [col])]
+
+
+def foci_columns(statistic, cutoff_percentile=None, relative=False):
+    """`cutoff_percentile` adds the cutoff column (Mock foci filter "cutoff" only);
+    `relative` adds the reference-scaled columns."""
     cutoff = [cutoff_column(cutoff_percentile)] if cutoff_percentile is not None else []
-    return [
+    return _with_relative([
         "image-filename-basename", *CONDITION_COLUMNS, "nucleus-id", "nucleus-area",
         baseline_column(statistic),
         "nucleus-fish-raw-integrated-intensity", "nucleus-fish-normalised-integrated-intensity",
@@ -220,24 +240,31 @@ def foci_columns(statistic, cutoff_percentile=None):
         "foci-fish-raw-integrated-intensity", "foci-fish-normalised-integrated-intensity",
         *cutoff, "foci-counted",
         "foci-max-intensity", "foci-centroid-x", "foci-centroid-y", "foci-extends-outside-nucleus",
-    ]
+    ], "foci", relative)
 
 
-def nucleus_columns(statistic, cutoff_percentile=None):
+def nucleus_columns(statistic, cutoff_percentile=None, relative=False):
     cutoff = [cutoff_column(cutoff_percentile)] if cutoff_percentile is not None else []
-    return [
+    return _with_relative([
         "image-filename-basename", *CONDITION_COLUMNS, "nucleus-id", "nucleus-area",
         baseline_column(statistic), *cutoff,
         "nucleus-fish-raw-integrated-intensity", "nucleus-fish-normalised-integrated-intensity",
         "foci-detected-count", "foci-count", "total-foci-area",
         "total-foci-fish-raw-integrated-intensity", "total-foci-fish-normalised-integrated-intensity",
         "mean-fish-raw-integrated-intensity-per-foci", "mean-fish-normalised-integrated-intensity-per-foci",
-    ]
+    ], "nucleus", relative)
 
 
 def baseline_columns(group_by):
     return [*group_by, "n-mock-nuclei", "n-mock-images", "median", "mean", "pooled-mean", "sd",
             "statistic-used"]
+
+
+def reference_columns():
+    return ["replicate", "rbp", "induction", "hiv-infection", "n-reference-nuclei",
+            "n-reference-foci-counted",
+            *(f"{c}-reference-mean" for c in REFERENCE_SCALED["nucleus"]),
+            "foci-fish-normalised-integrated-intensity-reference-mean"]
 
 
 def foci_filter_columns(group_by):
@@ -438,6 +465,57 @@ def summarise_per_nucleus(rows, statistic, cutoff_percentile=None):
             "mean-fish-normalised-integrated-intensity-per-foci": norm / len(foci) if foci else math.nan,
         })
     return out
+
+
+def reference_factors(foci_rows, nucleus_rows, condition):
+    """{replicate: reference-table row}: per replicate, the mean of each reference-scaled
+    column over the `condition` rows of that replicate.
+
+    `condition` maps parsed columns ("rbp", "induction", "hiv-infection") to values, e.g.
+    {"rbp": "GFP", "induction": "NoDox", "hiv-infection": "INF-48hpi"}. Per-nucleus columns
+    are averaged over the reference nuclei (NaN skipped, so the mean per focus uses nuclei
+    with counted foci); the per-focus `foci-fish-normalised-integrated-intensity` over the
+    counted reference foci. Raises ValueError for an unknown condition, a replicate
+    without reference nuclei or counted foci, or a mean <= 0.
+    """
+    bad = [f"{k}={v!r}" for k, v in condition.items()
+           if k not in CONDITION_VALUES or v not in CONDITION_VALUES[k]]
+    if bad or not condition:
+        raise ValueError(f"REFERENCE_CONDITION {condition} has unknown {', '.join(bad) or 'nothing'}; "
+                         f"keys and values must come from {CONDITION_VALUES}")
+    label = ", ".join(f"{k}={v}" for k, v in condition.items())
+
+    def is_reference(r):
+        return all(r[k] == v for k, v in condition.items())
+
+    table = {}
+    for rep in sorted({r["replicate"] for r in nucleus_rows}):
+        nuclei = [r for r in nucleus_rows if r["replicate"] == rep and is_reference(r)]
+        foci = [r["foci-fish-normalised-integrated-intensity"] for r in foci_rows
+                if r["replicate"] == rep and is_reference(r) and r["has-foci"] and r["foci-counted"]]
+        if not nuclei or not foci:
+            raise ValueError(f"replicate {rep} has no {'nuclei' if not nuclei else 'counted foci'} "
+                             f"for REFERENCE_CONDITION {label}")
+        row = {"replicate": rep, **{k: condition.get(k, "any") for k in ("rbp", "induction", "hiv-infection")},
+               "n-reference-nuclei": len(nuclei), "n-reference-foci-counted": len(foci)}
+        for c in REFERENCE_SCALED["nucleus"]:
+            row[f"{c}-reference-mean"] = float(np.nanmean([r[c] for r in nuclei]))
+        row["foci-fish-normalised-integrated-intensity-reference-mean"] = float(np.mean(foci))
+        not_positive = [k for k, v in row.items() if k.endswith("-reference-mean") and not v > 0]
+        if not_positive:
+            raise ValueError(f"replicate {rep}: reference mean <= 0 for {', '.join(not_positive)} "
+                             f"(REFERENCE_CONDITION {label})")
+        table[rep] = row
+    return table
+
+
+def scale_to_reference(rows, factors, table):
+    """Copies of `rows` with each REFERENCE_SCALED[table] column divided by its replicate's
+    reference mean, as `{column}-relative-to-reference` (the reference averages 1). The
+    per-focus table's nucleus column uses the same reference mean as the per-nucleus one."""
+    return [{**r, **{relative_column(c): r[c] / factors[r["replicate"]][f"{c}-reference-mean"]
+                     for c in REFERENCE_SCALED[table]}}
+            for r in rows]
 
 
 def foci_intensity_figure(rows, filter_table, group_by, title=""):

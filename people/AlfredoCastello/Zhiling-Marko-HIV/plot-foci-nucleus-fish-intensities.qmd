@@ -1,0 +1,203 @@
+---
+title: "HIV transcription foci and nucleus FISH intensities: plots"
+format: html
+editor_options:
+  chunk_output_type: inline
+---
+
+Plots of the tables written by `measure-foci-nucleus-fish-intensities.ipynb` (section 2). Column names are converted to snake_case on loading (`janitor::clean_names()`), e.g. `total-foci-fish-normalised-integrated-intensity-relative-to-reference` becomes `total_foci_fish_normalised_integrated_intensity_relative_to_reference`.
+
+## Environment
+
+```{r}
+#| label: setup
+library(tidyverse)
+library(ggbeeswarm)
+library(rstatix)
+library(ggpubr)
+```
+
+## Load tables
+
+`replicate` and `field` are read as text so their leading zeros are kept (`080623`, `001`).
+
+```{r}
+#| label: load
+out_dir <- "/Volumes/Jeff-exFAT/Marko_HIV/Marko_HIV_foci-quantification"
+
+read_quant <- function(file, text_cols = c("replicate", "field")) {
+  path <- file.path(out_dir, paste0("foci_intensity_quantification", file))
+  header <- names(read_csv(path, n_max = 0, show_col_types = FALSE))
+  text <- intersect(text_cols, header)
+  read_csv(path,
+           col_types = cols(.default = col_guess(),
+                            !!!set_names(rep(list(col_character()), length(text)), text)),
+           guess_max = Inf) |>
+    janitor::clean_names()
+}
+
+set_levels <- function(df) {
+  df |>
+    mutate(across(any_of("rbp"), \(x) factor(x, levels = c("GFP", "CPEB4", "MARF1"))),
+           across(any_of("induction"), \(x) factor(x, levels = c("NoDox", "Dox"))),
+           across(any_of("hiv_infection"), \(x) factor(x, levels = c("Mock", "INF-24hpi", "INF-48hpi"))))
+}
+
+foci <- read_quant(".csv") |> set_levels()                               # one row per detected focus + one per nucleus without foci
+nuclei <- read_quant("_summarised-per-nucleus.csv") |> set_levels()      # one row per nucleus (counted foci only)
+mock_baseline <- read_quant("_mock-baseline.csv")                         # Mock background per pixel, per baseline group
+mock_foci_filter <- read_quant("_mock-foci-filter.csv")                   # Mock foci cutoff and false-positive rate
+reference_factors <- if (file.exists(file.path(out_dir, "foci_intensity_quantification_reference-factors.csv"))) {
+  read_quant("_reference-factors.csv") |> set_levels()                   # per-replicate reference means (if REFERENCE_CONDITION was set)
+}
+```
+
+## Design check
+
+Nuclei per condition and replicate.
+
+```{r}
+#| label: design
+nuclei |>
+  count(rbp, induction, hiv_infection, replicate) |>
+  pivot_wider(names_from = replicate, values_from = n)
+```
+
+## Plots
+
+```{r}
+#| label: plots
+
+## foci count
+
+nuclei %>%
+  filter(foci_count > 0) %>%
+  ggplot(aes(x = induction, y = foci_count, 
+    colour = replicate, fill = replicate)) +
+  geom_quasirandom(stroke = 0, alpha = 0.5) +
+  facet_wrap(~rbp+hiv_infection) +
+  theme_bw() 
+
+View(foci)
+
+## foci total FISH intensity
+
+nuclei %>%
+  filter(foci_count > 0) %>%
+  ggplot(aes(x = induction, y = total_foci_fish_normalised_integrated_intensity_relative_to_reference)) +
+  geom_quasirandom(
+    aes(colour = replicate, fill = replicate),
+    stroke = 0, alpha = 0.5) +
+  scale_y_log10() +
+  facet_wrap(~rbp+hiv_infection) +
+  theme_bw() 
+
+
+## foci mean FISH intensity per focus
+
+nuclei %>%
+  filter(foci_count > 0) %>%
+  ggplot(aes(x = induction, y = mean_fish_normalised_integrated_intensity_per_foci_relative_to_reference)) +
+  geom_quasirandom(
+    aes(colour = replicate, fill = replicate),
+    stroke = 0, alpha = 0.5) +
+  geom_boxplot(width = 0.3) +
+  scale_y_log10() +
+  facet_wrap(~rbp+hiv_infection) +
+  theme_bw() 
+
+
+## nucleus FISH intensity 
+
+nuclei %>%
+  filter(foci_count > 0) %>%
+  ggplot(aes(x = induction, y = nucleus_fish_normalised_integrated_intensity_relative_to_reference, 
+    colour = replicate, fill = replicate)) +
+  geom_quasirandom(stroke = 0, alpha = 0.5) +
+  scale_y_log10() +
+  facet_wrap(~rbp+hiv_infection) +
+  theme_bw() 
+
+
+
+
+```
+
+## Statistics
+
+Nuclei from the same replicate are not independent, so the replicate is the experimental unit (a "SuperPlot", Lord et al. 2020 JCB). Each replicate is reduced to one value per condition: the geometric mean (mean of log10) for intensities, the arithmetic mean for counts. Dox and NoDox are then compared with a paired t-test across replicates (pairs = same replicate), on log10 values for intensities. The test only runs for an `rbp` × `hiv_infection` panel with at least `min_pairs` replicates that have both Dox and NoDox. Holm-adjusted p-values (across panels) are in `p.adj`.
+
+A non-parametric test on replicate means is not used: with 3–4 pairs, a Wilcoxon signed-rank test cannot give p < 0.125 whatever the data.
+
+```{r}
+#| label: stats-helpers
+replicate_means <- function(df, y, log = TRUE) {
+  df |>
+    filter(foci_count > 0, if (log) .data[[y]] > 0 else TRUE) |>
+    group_by(rbp, hiv_infection, induction, replicate) |>
+    summarise(n_nuclei = n(),
+              value = if (log) 10^mean(log10(.data[[y]])) else mean(.data[[y]]),
+              .groups = "drop")
+}
+
+dox_test <- function(reps, log = TRUE, min_pairs = 3) {
+  reps |>
+    mutate(value = if (log) log10(value) else value) |>
+    group_by(rbp, hiv_infection, replicate) |>
+    filter(n_distinct(induction) == 2) |>                 # replicates with both Dox and NoDox
+    group_by(rbp, hiv_infection) |>
+    filter(n_distinct(replicate) >= min_pairs) |>
+    arrange(induction, replicate, .by_group = TRUE) |>    # paired t-test pairs by row order
+    t_test(value ~ induction, paired = TRUE) |>
+    adjust_pvalue(method = "holm") |>
+    add_significance("p.adj")
+}
+
+# Nuclei as small points, replicate means as large outlined points joined by replicate,
+# Dox vs NoDox p-value (paired t-test on replicate means) where both are present.
+superplot <- function(y, log = TRUE, ylab = y, label = "p = {p}") {
+  cells <- nuclei |> filter(foci_count > 0, if (log) .data[[y]] > 0 else TRUE)
+  reps <- replicate_means(nuclei, y, log)
+  stats <- dox_test(reps, log) |>
+    left_join(cells |>
+                group_by(rbp, hiv_infection) |>
+                # stat_pvalue_manual() takes y.position in log10 units on a log10 axis
+                summarise(y.position = if (log) log10(max(.data[[y]])) + 0.15 else max(.data[[y]]) * 1.08,
+                          .groups = "drop"),
+              by = c("rbp", "hiv_infection"))
+  print(stats)
+
+  p <- ggplot(cells, aes(x = induction, y = .data[[y]], colour = replicate)) +
+    geom_quasirandom(stroke = 0, alpha = 0.3, size = 1) +
+    geom_line(data = filter(reps, n() == 2, .by = c(rbp, hiv_infection, replicate)),
+              aes(y = value, group = replicate)) +
+    geom_point(data = reps, aes(y = value, fill = replicate),
+               shape = 21, size = 4, colour = "black") +
+    stat_pvalue_manual(stats, label = label, tip.length = 0.01) +
+    facet_wrap(~ rbp + hiv_infection) +
+    labs(y = ylab) +
+    theme_bw()
+  expand <- expansion(mult = c(0.05, 0.12))
+  if (log) p + scale_y_log10(expand = expand) else p + scale_y_continuous(expand = expand)
+}
+```
+
+## SuperPlots
+
+```{r}
+#| label: superplots
+superplot("foci_count", log = FALSE) + 
+labs(title = "transcription foci count per nucleus", subtitle = "0-count removed, t-test comparison of replicate means") + 
+theme_bw(base_size = 15)
+
+superplot ("total_foci_fish_normalised_integrated_intensity_relative_to_reference") +
+labs(title = "total transcription foci intensity per nucleus", subtitle = "0-count removed, t-test comparison of replicate means") + 
+theme_bw(base_size = 15)
+
+superplot("mean_fish_normalised_integrated_intensity_per_foci_relative_to_reference")
+
+# nuclei with intensity <= 0 are dropped from the log axis and the geometric mean
+superplot("nucleus_fish_normalised_integrated_intensity_relative_to_reference") +
+labs(title = "nuclear HIV FISH intensity", subtitle = "nucleus only with one-or-more txn focus, t-test comparison of replicate means") + 
+theme_bw(base_size = 15)
+```
