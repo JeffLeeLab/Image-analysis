@@ -1,5 +1,9 @@
 #!/usr/bin/env python
-"""Optional read-only trusted diagnostic: identify the actual processor runtime."""
+"""Read-only diagnostic: report the Python that runs OMERO scripts and its key packages.
+
+Upload once as an official script and run it after changing the server's Python
+packages (see README.md). Keep the package list in step with requirements-scripts.txt.
+"""
 import importlib.metadata
 import json
 import os
@@ -10,11 +14,12 @@ from omero.rtypes import rstring
 
 
 def run():
-    client = scripts.client("Inspect_BGSub_Runtime.py", "Report the script processor interpreter and package versions; no image writes.")
+    client = scripts.client("Env_Check.py", "Report the script interpreter, import path and package versions; no writes.")
     try:
         info = {"python_executable": sys.executable, "python": platform.python_version(),
-                "platform": platform.platform(), "machine": platform.machine(), "uid": os.getuid()}
-        for package in ("omero-py", "numpy", "zeroc-ice"):
+                "platform": platform.platform(), "machine": platform.machine(), "uid": os.getuid(),
+                "sys_path": sys.path}
+        for package in ("omero-py", "zeroc-ice", "numpy", "Pillow", "scipy"):
             try:
                 info[package] = importlib.metadata.version(package)
             except importlib.metadata.PackageNotFoundError:

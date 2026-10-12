@@ -1,0 +1,4 @@
+# Extra Python packages for the OMERO server-side scripts in this folder.
+# Installed into the OMERO server's Python environment; see README.md.
+# Pin each to the exact version the server resolves on first install.
+scipy  # subtract-background
