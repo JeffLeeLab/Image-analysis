@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "omero-bgsub-worker"
+version = "0.1.0"
+description = "Isolated numerical worker for OMERO rolling-ball subtraction"
+requires-python = ">=3.11,<3.12"
+dependencies = ["numpy==2.2.6", "scipy==1.15.3"]
+
+[project.scripts]
+omero-bgsub-worker = "omero_bgsub.worker:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/omero_bgsub"]

@@ -1,0 +1,17 @@
+{
+  "worker_python": "/opt/omero-bgsub/0.1.0/worker/.venv/bin/python",
+  "journal_root": "/var/lib/omero-bgsub/journals",
+  "temporary_root": "/var/lib/omero-bgsub/tmp",
+  "max_concurrent_jobs": 1,
+  "max_images_per_batch": 100,
+  "max_planes_per_batch": 5000,
+  "max_xy_plane_pixels": 4194304,
+  "max_radius_pixels": 200,
+  "max_output_bytes": 21474836480,
+  "max_name_length": 255,
+  "max_batch_seconds": 14400,
+  "worker_timeout_seconds": 300,
+  "worker_memory_bytes": 2147483648,
+  "wrapper_memory_bytes": 2147483648,
+  "min_temporary_free_bytes": 1073741824
+}

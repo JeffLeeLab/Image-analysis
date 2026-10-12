@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+dist/
+.venv/
+# The repository-wide R/pkgdown rule ignores docs directories; keep these runbooks.
+!docs/
+!docs/*.md

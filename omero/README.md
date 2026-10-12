@@ -1,5 +1,12 @@
 # OMERO CLI environment
 
+The planned server-side background-subtraction script is specified in
+[server-side-script/subtract-background/spec.md](server-side-script/subtract-background/spec.md).
+The implementation and [installation guide](server-side-script/subtract-background/docs/INSTALL.md)
+are available. Local checks pass; live server deployment remains to be performed.
+Its dedicated uv numerical worker is a separate processor-host deployment; the
+local CLI environment below is unchanged.
+
 Named Miniforge environment: `omero`, with Python 3.11,
 OMERO.py 5.23.0, ZeroC Ice 3.6.5 and Bio-Formats CLI tools 8.1.1
 (`ome::bftools`, with OpenJDK).

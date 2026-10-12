@@ -1,0 +1,4 @@
+"""Numerical worker; deliberately has no OMERO dependency."""
+__version__ = "0.1.0"
+ALGORITHM_COMMIT = "e6360e0a7e04580ac30e143281edae66660f9ec6"
+ALGORITHM_SHA256 = "0713d5360395a9cf8748829b2f782d316fa3be57df1bc0827adff8a90af55c9c"
