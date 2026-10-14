@@ -97,6 +97,12 @@ class Naming(unittest.TestCase):
                                       ("noext", [5], "noext_bgs-5.tif")]:
             self.assertEqual(script.output_name(name, radii), expected)
 
+    def test_projection_marks_step_order(self):
+        for projection, expected in [(script.PROJECTION_OFF, "image_001_bgs-0-50.tif"),
+                                     (script.MIP_FIRST, "image_001_mip_bgs-0-50.tif"),
+                                     (script.MIP_LAST, "image_001_bgs-0-50_mip.tif")]:
+            self.assertEqual(script.output_name("image_001.ome.tif", [0, 50], projection), expected)
+
     def test_radius_tokens(self):
         for value, expected in [(50.0, "50"), (12.50, "12.5"), (1e2, "100"), (-0.0, "0"), (0.25, "0.25")]:
             self.assertEqual(script.radius_token(value), expected)
@@ -142,12 +148,59 @@ class CorrectPlane(unittest.TestCase):
             self.assertRaises(ValueError, script.correct_plane, plane, radius)
 
 
+class ZProjection(unittest.TestCase):
+    rng = np.random.default_rng(1)
+    stack = rng.integers(0, 4000, (4, 2, 1, 64, 80)).astype(np.uint16)  # z, c, t, y, x
+    radii = [0, 12.5]
+
+    def planes(self, projection, stack=None):
+        stack = self.stack if stack is None else stack
+        get_plane = lambda z, c, t: stack[z, c, t]
+        return list(script.output_planes(get_plane, *stack.shape[:3], self.radii, projection))
+
+    def test_off_keeps_every_plane(self):
+        planes = self.planes(script.PROJECTION_OFF)
+        self.assertEqual(len(planes), 8)
+        for z, c, t, plane in planes:
+            self.assertTrue(np.array_equal(plane, script.correct_plane(self.stack[z, c, t], self.radii[c])))
+
+    def test_project_then_subtract(self):
+        planes = self.planes(script.MIP_FIRST)
+        self.assertEqual([(z, c, t) for z, c, t, _ in planes], [(0, 0, 0), (0, 1, 0)])
+        for _, c, t, plane in planes:
+            expected = script.correct_plane(self.stack[:, c, t].max(axis=0), self.radii[c])
+            self.assertTrue(np.array_equal(plane, expected))
+
+    def test_subtract_then_project(self):
+        planes = self.planes(script.MIP_LAST)
+        self.assertEqual([(z, c, t) for z, c, t, _ in planes], [(0, 0, 0), (0, 1, 0)])
+        for _, c, t, plane in planes:
+            expected = np.max([script.correct_plane(p, self.radii[c]) for p in self.stack[:, c, t]], axis=0)
+            self.assertTrue(np.array_equal(plane, expected))
+
+    def test_zero_radius_is_raw_mip_in_both_orders(self):
+        for projection in (script.MIP_FIRST, script.MIP_LAST):
+            _, _, _, plane = self.planes(projection)[0]
+            self.assertEqual(plane.dtype, self.stack.dtype)
+            self.assertTrue(np.array_equal(plane, self.stack[:, 0, 0].max(axis=0)))
+
+    def test_orders_differ(self):
+        first, last = self.planes(script.MIP_FIRST)[1][3], self.planes(script.MIP_LAST)[1][3]
+        self.assertFalse(np.array_equal(first, last))
+
+    def test_nan_slice_rejected_in_both_orders(self):
+        stack = self.stack.astype(np.float32)
+        stack[2, 0, 0, 0, 0] = np.nan
+        for projection in (script.MIP_FIRST, script.MIP_LAST):
+            self.assertRaises(ValueError, self.planes, projection, stack)
+
+
 class Dialog(unittest.TestCase):
     params = {p.name(): p for p in script.parameters()}
 
     def test_parameter_names(self):
         expected = (["Data_Type", "IDs", "Name_Filter"] + [f"Channel_{i}_Radius" for i in range(1, 7)]
-                    + ["Output_Dataset_ID", "New_Dataset_Name", "Dry_Run"])
+                    + ["Z_Projection", "Output_Dataset_ID", "New_Dataset_Name", "Dry_Run"])
         self.assertEqual(list(self.params), expected)
 
     def test_radius_is_optional_without_default(self):
@@ -156,6 +209,12 @@ class Dialog(unittest.TestCase):
             self.assertTrue(radius.optional)
             self.assertFalse(radius.useDefault)
             self.assertEqual(unwrap(radius.min), 0)
+
+    def test_projection_is_off_by_default(self):
+        projection = self.params["Z_Projection"]
+        self.assertTrue(projection.useDefault)
+        self.assertEqual(unwrap(projection.prototype), "Off")
+        self.assertEqual(unwrap(projection.values), list(script.PROJECTIONS))
 
     def test_dry_run_is_default(self):
         self.assertTrue(self.params["Dry_Run"].useDefault)
@@ -179,6 +238,11 @@ class Preflight(unittest.TestCase):
         self.assertIn("2 image(s) -> dataset 9 'out'", message)
         self.assertIn("1 DAPI=0 (copied), 2 GFP=50", message)
         self.assertLess(message.index("1 a.tif -> a_bgs-0-50.tif"), message.index("2 b.ome.tif -> b_bgs-0-50.tif"))
+
+    def test_dry_run_with_projection(self):
+        message, _ = self.run_with(Z_Projection=script.MIP_FIRST)
+        self.assertIn("Z projection: Max projection, then subtract.", message)
+        self.assertIn("1 a.tif -> a_mip_bgs-0-50.tif", message)
 
     def test_missing_radius_is_not_zero(self):
         message, _ = self.run_with(Channel_2_Radius=None)

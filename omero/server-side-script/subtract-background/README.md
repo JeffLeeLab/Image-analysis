@@ -10,9 +10,10 @@
 2. Enter a radius for each channel. `Channel_1_Radius` is the first channel, and radii are in XY pixels.
    - **0 keeps that channel unchanged. If every radius is 0, the image is copied.**
    - Leave the fields blank for channels the images don't have.
-3. Choose where results go: **either** `Output_Dataset_ID` (an existing dataset) **or** `New_Dataset_Name`.
-4. Run with `Dry_Run` ticked, which is the default. Check the message: it lists each channel's name with its radius, and every planned output name.
-5. Untick `Dry_Run` and run again with the same settings.
+3. Optionally choose a `Z_Projection` (default `Off`); see [Z projection](#z-projection).
+4. Choose where results go: **either** `Output_Dataset_ID` (an existing dataset) **or** `New_Dataset_Name`.
+5. Run with `Dry_Run` ticked, which is the default. Check the message: it lists each channel's name with its radius, the Z projection, and every planned output name.
+6. Untick `Dry_Run` and run again with the same settings.
 
 Rules:
 
@@ -24,23 +25,34 @@ Rules:
 - **`Name_Filter`** is an optional wildcard on the full image name, for example `*.tif`. If you select a dataset that already holds earlier `_bgs-` results, they are processed again unless the filter excludes them.
 - **Cancelling** a running job can leave the image being written as a partial image under *Orphaned Images*. Delete it.
 
+### Z projection
+
+`Z_Projection` makes a max-intensity projection along Z, so each output has a single Z-plane. It is `Off` by default.
+
+- **Max projection, then subtract:** projects the raw slices, then estimates and removes one background from the projection. The rolling ball runs once per channel and timepoint, so this is about Z times faster.
+- **Subtract, then max projection:** removes each slice's own background, then projects the corrected slices. This suits stacks whose background changes with depth.
+
+The two orders give different pixels for any channel with a radius above 0. A channel with radius 0 is the raw max projection either way. An image with one Z-plane is left as it is.
+
 ## Outputs
 
-Names are fixed: `{basename}_bgs-{radius of channel 1}-{channel 2}-….tif`.
+Names are fixed: `{basename}_bgs-{radius of channel 1}-{channel 2}-….tif`. With a Z projection, `_mip` is placed where the projection happens in the processing order.
 
 | Source name | Radii | Output name |
 |---|---|---|
 | `image_001.ome.tif` | 0, 50, 100 | `image_001_bgs-0-50-100.tif` |
 | `sample.tiff` | 12.5, 0, 100 | `sample_bgs-12.5-0-100.tif` |
 | `sample.vsi` | 0, 0, 0 | `sample_bgs-0-0-0.tif` |
+| `image_001.ome.tif`, max projection then subtract | 0, 50 | `image_001_mip_bgs-0-50.tif` |
+| `image_001.ome.tif`, subtract then max projection | 0, 50 | `image_001_bgs-0-50_mip.tif` |
 
 About the names:
 - `.tif` is only part of the OMERO image name. No TIFF file is created; export through OMERO as usual.
 - A repeated run creates new images even when the names match. Use image IDs to tell them apart.
 
 Each output also gets:
-- **A description and a key-value annotation** (namespace `org.jeffleelab.omero.bgsub`). It records the source image ID and name, the radius for each channel, the settings, the algorithm commit and hash, the script version and the time.
-- **Copied metadata.** OMERO's `copyAndResizeImage` copies the source's dimensions, pixel type, physical pixel sizes and channel metadata; the live check confirms which fields carry over. Per-plane timing and positions, ROIs, tags, attachments and rendering settings are not copied.
+- **A description and a key-value annotation** (namespace `org.jeffleelab.omero.bgsub`). It records the source image ID and name, the radius for each channel, the Z projection, the settings, the algorithm commit and hash, the script version and the time.
+- **Copied metadata.** OMERO's `copyAndResizeImage` copies the source's dimensions (with Z = 1 for a projection), pixel type, physical pixel sizes and channel metadata; the live check confirms which fields carry over. Per-plane timing and positions, ROIs, tags, attachments and rendering settings are not copied.
 
 Fixed settings:
 - presmoothing on;
@@ -55,7 +67,7 @@ The server needs no conda; everything runs in the OMERO server's own Python. Sci
 
 1. In OMERO.web, open **Scripts → Upload Script** and upload `Env_Check.py`, then this script, into one folder such as `/jefflee_lab`. [Installing a script](../README.md#installing-a-script) has the details and the other ways to install.
 2. Run **Env_Check** from the Scripts menu. Confirm that it reports SciPy 1.17.1 and NumPy 2.4.6, and note the `omero-py` version.
-3. Open **Batch_Rolling_Ball_Background** from the Scripts menu and check that it shows the 12 fields.
+3. Open **Batch_Rolling_Ball_Background** from the Scripts menu and check that it shows the 13 fields.
 
 To install a new version, upload the new file with the same name into the same folder. OMERO.web offers **Replace script**, and the script keeps its ID.
 
@@ -65,7 +77,7 @@ Do this once after installing. Use a small multichannel image and a test dataset
 
 1. **Environment:** `Env_Check.py` reports SciPy 1.17.1 and NumPy 2.4.6.
 2. **Dry run:** the channel names, radii, output name and destination are as expected.
-3. **Runs:** run once with every radius 0, and once with real radii.
+3. **Runs:** run once with every radius 0, once with real radii, and once with each Z projection order on a z-stack.
 4. **Pixels:** compare the outputs with a recalculation on your Mac. Run this in the `omero` conda env, from this folder:
 
 ```python
@@ -79,16 +91,18 @@ conn = BlitzGateway(input("User: "), getpass.getpass(), host="OMERO_HOST", port=
 conn.connect()
 src, out = conn.getObject("Image", SOURCE_ID), conn.getObject("Image", OUTPUT_ID)
 radii = [0, 50, 100]  # the radii used for this output
+projection = "Off"    # the Z_Projection used for this output, exactly as shown in the dialog
 ps, po = src.getPrimaryPixels(), out.getPrimaryPixels()
-diffs = [np.abs(bgs.correct_plane(ps.getPlane(z, c, t), radii[c]).astype(float) - po.getPlane(z, c, t))
-         for z in range(src.getSizeZ()) for c in range(src.getSizeC()) for t in range(src.getSizeT())]
+diffs = [np.abs(plane.astype(float) - po.getPlane(z, c, t))
+         for z, c, t, plane in bgs.output_planes(ps.getPlane, src.getSizeZ(), src.getSizeC(),
+                                                 src.getSizeT(), radii, projection)]
 print("max difference:", max(d.max() for d in diffs))
 conn.close()
 ```
 
    - With every radius 0, the difference must be 0.
    - With real radii, expect 0. A difference of 1 in integer images can come from different NumPy/SciPy builds on the server and your computer.
-5. **In OMERO.web:** check that the output is in the chosen dataset, with the correct name, pixel type, sizes, channel names and physical sizes, and that it has the key-value annotation.
+5. **In OMERO.web:** check that the output is in the chosen dataset, with the correct name, pixel type, sizes (Z = 1 for a projection), channel names and physical sizes, and that it has the key-value annotation.
 6. **As a normal user:** repeat one small run as a non-admin user in a normal group.
 
 ## Local tests (on your Mac)

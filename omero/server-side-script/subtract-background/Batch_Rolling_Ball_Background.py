@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime
 import fnmatch
+import functools
 import math
 from decimal import Decimal
 
@@ -24,7 +25,7 @@ try:
 except ImportError:  # reported when the script runs, so it still lists in OMERO.web
     ndi = None
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 MAX_CHANNELS = 6
 MAX_NAME_LENGTH = 255
 MAX_MESSAGE_LINES = 50
@@ -35,6 +36,8 @@ SETTINGS = ("presmooth on; automatic shrink; dark background; "
             "corrected negatives clipped to 0; source pixel type kept")
 SUPPORTED_TYPES = ("uint8", "uint16", "float")
 RADIUS_HELP = "Radius in XY pixels. 0 = skip subtraction and keep this channel unchanged."
+PROJECTIONS = ("Off", "Max projection, then subtract", "Subtract, then max projection")
+PROJECTION_OFF, MIP_FIRST, MIP_LAST = PROJECTIONS
 
 
 # Pinned rolling-ball algorithm, copied verbatim (lines 21-206) from
@@ -243,8 +246,8 @@ def radius_token(value):
     return token.rstrip("0").rstrip(".") if "." in token else token
 
 
-def output_name(name, radii):
-    """Fixed output name: {basename}_bgs-{r0}-{r1}-....tif"""
+def output_name(name, radii, projection=PROJECTION_OFF):
+    """Fixed output name: {basename}_bgs-{r0}-{r1}-....tif, with _mip placed in step order."""
     base = name
     for suffix in (".ome.tiff", ".ome.tif", ".tiff", ".tif"):
         if name.lower().endswith(suffix):
@@ -256,7 +259,9 @@ def output_name(name, radii):
             base = name[:dot]
     if not base:
         raise ValueError(f"Image name '{name}' has an empty basename")
-    result = base + "_bgs-" + "-".join(radius_token(r) for r in radii) + ".tif"
+    bgs = "_bgs-" + "-".join(radius_token(r) for r in radii)
+    steps = {MIP_FIRST: "_mip" + bgs, MIP_LAST: bgs + "_mip"}.get(projection, bgs)
+    result = base + steps + ".tif"
     if len(result) > MAX_NAME_LENGTH:
         raise ValueError(f"Output name for '{name}' exceeds {MAX_NAME_LENGTH} characters")
     return result
@@ -277,6 +282,25 @@ def correct_plane(plane, radius):
     if not np.isfinite(corrected).all() or corrected.max() > np.finfo(np.float32).max:
         raise ValueError("Corrected values are not representable as float32")
     return corrected.astype(plane.dtype)
+
+
+def z_max(planes):
+    """Pixel-wise maximum over z. NaN carries through, so correct_plane still rejects it."""
+    return functools.reduce(np.maximum, planes)
+
+
+def output_planes(get_plane, size_z, size_c, size_t, radii, projection):
+    """Yield (z, c, t, plane) for the output; a projected output has one z-plane."""
+    for c in range(size_c):
+        for t in range(size_t):
+            stack = (get_plane(z, c, t) for z in range(size_z))
+            if projection == MIP_FIRST:
+                yield 0, c, t, correct_plane(z_max(stack), radii[c])
+            elif projection == MIP_LAST:
+                yield 0, c, t, z_max(correct_plane(plane, radii[c]) for plane in stack)
+            else:
+                for z, plane in enumerate(stack):
+                    yield z, c, t, correct_plane(plane, radii[c])
 
 
 def channel_mapping(names, radii):
@@ -347,9 +371,10 @@ def plan_batch(images, params):
     if not errors:
         # Canonical values drive both processing and names.
         radii = [float(radius_token(r)) for r in given[:size_c]]
+        projection = params.get("Z_Projection", PROJECTION_OFF)
         for image in images:
             try:
-                plan.append((image, output_name(image.getName(), radii)))
+                plan.append((image, output_name(image.getName(), radii, projection)))
             except ValueError as exc:
                 errors.append(str(exc))
     if errors:
@@ -375,13 +400,14 @@ def resolve_destination(conn, params):
     return dataset, None
 
 
-def add_provenance(conn, new_image, source, mapping):
+def add_provenance(conn, new_image, source, mapping, projection):
     annotation = MapAnnotationWrapper(conn)
     annotation.setNs(NAMESPACE)
     annotation.setValue([
         ["source_image_id", str(source.getId())],
         ["source_image_name", source.getName()],
         ["radii_by_channel", mapping],
+        ["z_projection", projection],
         ["settings", SETTINGS],
         ["algorithm_commit", ALGORITHM_COMMIT],
         ["algorithm_sha256", ALGORITHM_SHA256],
@@ -392,40 +418,39 @@ def add_provenance(conn, new_image, source, mapping):
     new_image.linkAnnotation(annotation)
 
 
-def process_image(conn, image, radii, name, dataset, mapping):
+def process_image(conn, image, radii, name, dataset, mapping, projection):
     """Write one background-subtracted copy of image into dataset."""
     pixels_service = conn.getPixelsService()
     update = conn.getUpdateService()
     size_z, size_c, size_t = image.getSizeZ(), image.getSizeC(), image.getSizeT()
+    out_z = size_z if projection == PROJECTION_OFF else 1
     # Copies dimensions, pixel type, physical sizes and channel metadata, not pixels.
     new_id = pixels_service.copyAndResizeImage(
-        image.getId(), rint(image.getSizeX()), rint(image.getSizeY()), rint(size_z), rint(size_t),
+        image.getId(), rint(image.getSizeX()), rint(image.getSizeY()), rint(out_z), rint(size_t),
         list(range(size_c)), None, False, conn.SERVICE_OPTS).getValue()
     try:
         new_image = conn.getObject("Image", new_id)
         new_image._obj.setName(rstring(name))
         new_image._obj.setDescription(rstring(
             f"Rolling-ball background subtraction of image {image.getId()} ({image.getName()}). "
-            f"Radii by channel: {mapping}. {SETTINGS}."))
+            f"Radii by channel: {mapping}. Z projection: {projection}. {SETTINGS}."))
         update.saveObject(new_image._obj, conn.SERVICE_OPTS)
         source_pixels = image.getPrimaryPixels()
         ranges = [[math.inf, -math.inf] for _ in range(size_c)]
         store = conn.c.sf.createRawPixelsStore()
         try:
             store.setPixelsId(new_image.getPixelsId(), True, conn.SERVICE_OPTS)
-            for z in range(size_z):
-                for c in range(size_c):
-                    for t in range(size_t):
-                        result = correct_plane(source_pixels.getPlane(z, c, t), radii[c])
-                        wire = np.ascontiguousarray(result, dtype=result.dtype.newbyteorder(">"))
-                        store.setPlane(wire.tobytes(), z, c, t, conn.SERVICE_OPTS)
-                        ranges[c] = [min(ranges[c][0], float(result.min())),
-                                     max(ranges[c][1], float(result.max()))]
+            for z, c, t, result in output_planes(source_pixels.getPlane, size_z, size_c, size_t,
+                                                 radii, projection):
+                wire = np.ascontiguousarray(result, dtype=result.dtype.newbyteorder(">"))
+                store.setPlane(wire.tobytes(), z, c, t, conn.SERVICE_OPTS)
+                ranges[c] = [min(ranges[c][0], float(result.min())),
+                             max(ranges[c][1], float(result.max()))]
         finally:
             store.close(conn.SERVICE_OPTS)
         for c, (low, high) in enumerate(ranges):
             pixels_service.setChannelGlobalMinMax(new_image.getPixelsId(), c, low, high, conn.SERVICE_OPTS)
-        add_provenance(conn, new_image, image, mapping)
+        add_provenance(conn, new_image, image, mapping, projection)
         # Link last, so only finished images appear in the dataset.
         link = omero.model.DatasetImageLinkI()
         link.setParent(omero.model.DatasetI(dataset.getId(), False))
@@ -459,9 +484,11 @@ def run(conn, params):
     except ValueError as exc:
         return "Nothing was written.\n" + str(exc), {}
     mapping = channel_mapping(names, radii)
+    projection = params.get("Z_Projection", PROJECTION_OFF)
     if params.get("Dry_Run", True):
         target = f"dataset {dataset.getId()} '{dataset.getName()}'" if dataset else f"new dataset '{new_name}'"
-        lines = [f"Dry run: {len(plan)} image(s) -> {target}.", f"Channels: {mapping}."]
+        lines = [f"Dry run: {len(plan)} image(s) -> {target}.", f"Channels: {mapping}.",
+                 f"Z projection: {projection}."]
         lines += limited([f"{image.getId()} {image.getName()} -> {name}" for image, name in plan])
         return "\n".join(lines + ["Untick Dry_Run to process."]), {}
     if dataset is None:
@@ -472,12 +499,12 @@ def run(conn, params):
     for index, (image, name) in enumerate(plan, start=1):
         print(f"Image {index}/{len(plan)}: {image.getId()} {image.getName()}", flush=True)
         try:
-            done.append(process_image(conn, image, radii, name, dataset, mapping))
+            done.append(process_image(conn, image, radii, name, dataset, mapping, projection))
         except Exception as exc:
             failed.append(f"{image.getId()} {image.getName()}: {type(exc).__name__}: {exc}")
             print(failed[-1], flush=True)
     lines = [f"{len(done)} of {len(plan)} image(s) written to dataset {dataset.getId()} '{dataset.getName()}'.",
-             f"Channels: {mapping}."]
+             f"Channels: {mapping}.", f"Z projection: {projection}."]
     if failed:
         lines += ["Failed (no output kept):"] + limited(failed)
     outputs = {"Dataset": dataset._obj}
@@ -501,11 +528,16 @@ def parameters():
         params.append(scripts.Double(f"Channel_{i}_Radius", grouping=f"{3 + i:02d}", min=0,
                                      description=f"Channel {i}. {RADIUS_HELP}"))
     params += [
-        scripts.Long("Output_Dataset_ID", grouping=f"{4 + MAX_CHANNELS:02d}", min=1,
+        scripts.String("Z_Projection", grouping=f"{4 + MAX_CHANNELS:02d}", default=PROJECTION_OFF,
+                       values=[rstring(p) for p in PROJECTIONS],
+                       description="Optional max-intensity projection along Z; the output has one Z-plane. "
+                                   "Projecting first runs the rolling ball once per channel and timepoint "
+                                   "instead of once per slice."),
+        scripts.Long("Output_Dataset_ID", grouping=f"{5 + MAX_CHANNELS:02d}", min=1,
                      description="Put the results in this existing dataset..."),
-        scripts.String("New_Dataset_Name", grouping=f"{5 + MAX_CHANNELS:02d}",
+        scripts.String("New_Dataset_Name", grouping=f"{6 + MAX_CHANNELS:02d}",
                        description="...or create a new dataset with this name. Give exactly one of the two."),
-        scripts.Bool("Dry_Run", grouping=f"{6 + MAX_CHANNELS:02d}", default=True,
+        scripts.Bool("Dry_Run", grouping=f"{7 + MAX_CHANNELS:02d}", default=True,
                      description="Check inputs and list planned outputs without writing anything. "
                                  "Untick to process."),
     ]
@@ -518,7 +550,8 @@ def run_script():
         "Rolling-ball background subtraction (ImageJ port) on raw planes, one radius per channel. "
         "Set a radius to 0 to keep that channel unchanged; if all radii are 0 the image is copied. "
         "Results are new images named {basename}_bgs-{r1}-{r2}-....tif in one dataset; "
-        "originals are not changed. " + SETTINGS + ". Run with Dry_Run first.",
+        "originals are not changed. Z_Projection optionally max-projects along Z before or after "
+        "subtraction (_mip in the name marks where). " + SETTINGS + ". Run with Dry_Run first.",
         *parameters(),
         version=VERSION, authors=["Jeff Lee Lab"], institutions=["Jeff Lee Lab"], namespaces=[NAMESPACE])
     try:

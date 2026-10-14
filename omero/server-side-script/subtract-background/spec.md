@@ -1,6 +1,6 @@
-# OMERO batch rolling-ball background subtraction: specification v0.2
+# OMERO batch rolling-ball background subtraction: specification v0.3
 
-Revised 12 October 2026.
+Revised 14 October 2026. v0.3 adds the optional Z max-intensity projection (§2).
 
 This revision replaces the v0.1 specification, which called for an uploaded entry script, an external adapter package, a separate uv worker environment and journal-based resume. That design and its implementation are kept in git commit `84108b4`.
 
@@ -16,6 +16,7 @@ Scientific validation was done in the owner's RDI-calculator project. It is acce
 | Channels | Up to 6. One radius field per channel, in stored channel order. Every channel needs a value; 0 means copy unchanged. |
 | Batch | Same channel count and same ordered (trimmed) channel names across all images. X/Y/Z/T may vary. |
 | Algorithm | The pinned port, unchanged. Presmooth on, automatic shrink, dark background, corrected negatives clipped to 0. |
+| Z projection | Optional, off by default: a max-intensity projection along Z, either before or after subtraction. The output then has one Z-plane. |
 | Pixel types | uint8, uint16, float32. Each output keeps its source's type. |
 | Destination | Exactly one: an existing dataset ID, or a new dataset name. |
 | Naming | Fixed: `{basename}_bgs-{r1}-…-{rC}.tif` |
@@ -34,7 +35,12 @@ Scientific validation was done in the owner's RDI-calculator project. It is acce
   3. uint8/uint16: clip to the type range, `floor(x + 0.5)`, then cast once.
   4. float32: require finite values within the float32 range, then cast once.
 - Float planes containing NaN or Inf are rejected, including in copied channels.
-- Not supported: 3D or cross-time processing, light-background mode, shrink override, tiling of large planes.
+- **Z projection** (`Z_Projection`, default `Off`). For each C and T, the output is one plane at Z = 0:
+  - `Max projection, then subtract`: the pixel-wise maximum of the raw Z-planes, then corrected as above.
+  - `Subtract, then max projection`: every Z-plane corrected as above, then the pixel-wise maximum.
+  - With radius 0, both orders give the raw maximum projection. A NaN or Inf in any Z-plane is rejected.
+  - Images with one Z-plane are allowed; the projection then changes nothing, but the name still records it.
+- Not supported: 3D processing other than the max projection, cross-time processing, light-background mode, shrink override, tiling of large planes.
 
 ## 3. Dialog
 
@@ -44,6 +50,7 @@ Scientific validation was done in the owner's RDI-calculator project. It is acce
 | `IDs` | List of Long, required | Image IDs, or exactly one dataset ID |
 | `Name_Filter` | String, optional | Wildcard (`*`, `?`) on the full name; blank includes all |
 | `Channel_1_Radius` … `Channel_6_Radius` | Double ≥ 0, optional, **no default** | Radius per channel; 0 keeps the channel unchanged |
+| `Z_Projection` | Off \| Max projection, then subtract \| Subtract, then max projection; default Off | Optional max-intensity projection along Z, and its order |
 | `Output_Dataset_ID` | Long, optional | Existing destination dataset |
 | `New_Dataset_Name` | String, optional | Create a destination dataset with this name |
 | `Dry_Run` | Bool, default True | Check and list the plan without writing |
@@ -70,16 +77,20 @@ The run fails with all errors listed, and nothing written, if any of these is tr
 **Name.**
 1. Take the full stored image name.
 2. Remove a final `.ome.tiff`, `.ome.tif`, `.tiff` or `.tif`, ignoring case and trying the longest first. For other names, remove the last dot-suffix unless the dot is the first or last character.
-3. Append `_bgs-` and the radii in channel order, joined by `-`, then `.tif`.
+3. Append `_bgs-` and the radii in channel order, joined by `-`.
+4. With a Z projection, add `_mip` where the step runs: before `_bgs-` when projecting first, after the radii when subtracting first.
+5. Append `.tif`.
+
+Examples: `image_001_bgs-0-50.tif` (off), `image_001_mip_bgs-0-50.tif` (project first), `image_001_bgs-0-50_mip.tif` (subtract first).
 
 Radii are written in their shortest decimal form: `50.0 → 50`, `12.50 → 12.5`, `1e2 → 100`. Names are never truncated or de-duplicated. Image IDs distinguish repeated runs. `.tif` is a label only; no TIFF file is created.
 
 **Image.** For each source image, the script:
-1. calls `copyAndResizeImage` on the source, which copies dimensions, pixel type, physical sizes and channel metadata, but not pixels;
+1. calls `copyAndResizeImage` on the source, which copies dimensions (Z set to 1 with a projection), pixel type, physical sizes and channel metadata, but not pixels;
 2. sets the name and description;
 3. uploads planes with `RawPixelsStore.setPlane(z, c, t)`;
 4. sets each channel's min/max;
-5. adds the key-value annotation (namespace `org.jeffleelab.omero.bgsub`), which records the source ID and name, radius per channel, settings, algorithm commit and SHA-256, script version and UTC time;
+5. adds the key-value annotation (namespace `org.jeffleelab.omero.bgsub`), which records the source ID and name, radius per channel, Z projection, settings, algorithm commit and SHA-256, script version and UTC time;
 6. **last**, links the image to the destination dataset.
 
 If any step fails, the script deletes that new image and its annotation. Not copied: per-plane timing and positions, ROIs, tags, attachments, rendering settings.
@@ -97,10 +108,11 @@ If any step fails, the script deletes that new image and its annotation. Not cop
   - the pinned block, byte for byte;
   - naming;
   - copying, rounding and NaN rejection;
+  - both Z projection orders, with radius 0 and with NaN slices;
   - agreement with the pinned module;
   - the dialog declaration;
   - preflight and dry-run messages, using fake OMERO objects.
-- **Live:** the checklist in [README.md](README.md#live-check) covers the SciPy environment, a dry run, exact copying when every radius is 0, agreement of positive-radius pixels with a local recalculation, metadata and links, and a run as a non-admin user.
+- **Live:** the checklist in [README.md](README.md#live-check) covers the SciPy environment, a dry run, exact copying when every radius is 0, a projected run, agreement of positive-radius pixels with a local recalculation, metadata and links, and a run as a non-admin user.
 
 ## 7. Deliberately left out (v0.1 features)
 

@@ -63,9 +63,24 @@ as Orphaned Images, pass the files rather than their directory:
 
 “Orphaned Images” is a view of images not linked to a Dataset, not a real
 Dataset itself. The script therefore omits the import target for explicit file
-arguments. It logs out when the import finishes. `-c` asks the importer to
-continue with later files if one import fails; check the final exit status and
-messages for errors.
+arguments. It logs out when the import finishes.
+
+Re-running is safe and does not create duplicates. The script:
+
+1. Scans the input with Bio-Formats to list the files it should import.
+2. Imports with `-c --exclude clientpath`: the importer continues past a failed
+   file, and skips any file whose original path is already recorded in OMERO.
+3. Checks the Dataset (or, for explicit files, your images) for every scanned
+   file using `verify_upload.py`, which reuses the script's login session.
+4. Repeats steps 2–3 for the missing files, up to 3 attempts in total, stopping
+   early if an attempt imports nothing new.
+
+The exit status is 0 only when every file is verified in OMERO. A file can be
+skipped forever if OMERO already holds a fileset for its path, for example
+from an import that uploaded the file but then failed, or because the image is
+in another Dataset. The final report names those Fileset IDs: delete a failed
+import in OMERO.web and run again, or link the existing image to the Dataset.
+The retry and verification steps have not yet been tested against the server.
 
 ## Convert VSI files to TIFF
 
