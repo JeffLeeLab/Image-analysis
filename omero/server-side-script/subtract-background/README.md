@@ -2,7 +2,7 @@
 
 [Batch_Rolling_Ball_Background.py](Batch_Rolling_Ball_Background.py) is a single-file OMERO script. It applies the lab's pinned ImageJ rolling-ball port to raw image planes, with one radius per channel. It writes the results as new images into one dataset and never changes the originals. The contract is in [spec.md](spec.md).
 
-**Status:** the local checks pass (`test_local.py`). The script has **not yet been run on the OMERO server**; see [Live check](#live-check).
+**Status:** the local checks (`test_local.py`) pass with the server's versions of Python (3.11), NumPy (2.4.6) and SciPy (1.17.1). The script has **not yet been run on the OMERO server**; see [Live check](#live-check).
 
 ## Using it in OMERO.web
 
@@ -51,28 +51,22 @@ Fixed settings:
 
 ## Installing (OMERO admin)
 
-1. Add SciPy to the OMERO server's Python by following [../README.md](../README.md).
-2. Upload the script:
+The server needs no conda; everything runs in the OMERO server's own Python. SciPy 1.17.1 is already installed there (see [Server environment](../README.md#server-environment)).
 
-```sh
-conda activate omero
-cd omero/server-side-script/subtract-background
-omero login
-omero script upload --official Batch_Rolling_Ball_Background.py
-omero script list                 # note the script ID
-omero script params SCRIPT_ID     # should list the 12 fields
-```
+1. In OMERO.web, open **Scripts → Upload Script** and upload `Env_Check.py`, then this script, into one folder such as `/jefflee_lab`. [Installing a script](../README.md#installing-a-script) has the details and the other ways to install.
+2. Run **Env_Check** from the Scripts menu. Confirm that it reports SciPy 1.17.1 and NumPy 2.4.6, and note the `omero-py` version.
+3. Open **Batch_Rolling_Ball_Background** from the Scripts menu and check that it shows the 12 fields.
 
-To install a new version, run `omero script replace SCRIPT_ID Batch_Rolling_Ball_Background.py`.
+To install a new version, upload the new file with the same name into the same folder. OMERO.web offers **Replace script**, and the script keeps its ID.
 
 ## Live check
 
 Do this once after installing. Use a small multichannel image and a test dataset.
 
-1. **Environment:** `Env_Check.py` reports a SciPy version.
+1. **Environment:** `Env_Check.py` reports SciPy 1.17.1 and NumPy 2.4.6.
 2. **Dry run:** the channel names, radii, output name and destination are as expected.
 3. **Runs:** run once with every radius 0, and once with real radii.
-4. **Pixels:** compare the outputs with a local recalculation. Run this in the `omero` env from this folder:
+4. **Pixels:** compare the outputs with a recalculation on your Mac. Run this in the `omero` conda env, from this folder:
 
 ```python
 import getpass, importlib.util
@@ -97,7 +91,7 @@ conn.close()
 5. **In OMERO.web:** check that the output is in the chosen dataset, with the correct name, pixel type, sizes, channel names and physical sizes, and that it has the key-value annotation.
 6. **As a normal user:** repeat one small run as a non-admin user in a normal group.
 
-## Local tests
+## Local tests (on your Mac)
 
 ```sh
 conda activate omero      # includes SciPy; see ../../environment.yml

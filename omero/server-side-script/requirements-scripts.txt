@@ -1,4 +1,5 @@
 # Extra Python packages for the OMERO server-side scripts in this folder.
 # Installed into the OMERO server's Python environment; see README.md.
 # Pin each to the exact version the server resolves on first install.
-scipy  # subtract-background
+scipy==1.17.1          # subtract-background
+scikit-image==0.26.0   # installed October 2026; no script uses it yet

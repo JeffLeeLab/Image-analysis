@@ -10,8 +10,8 @@ Scientific validation was done in the owner's RDI-calculator project. It is acce
 
 | Area | Requirement |
 |---|---|
-| Delivery | One self-contained script, `Batch_Rolling_Ball_Background.py`, uploaded as an official (trusted) OMERO script. No helper modules. |
-| Runtime | The OMERO server's own Python. SciPy is added to it following [../README.md](../README.md), using pinned add-ons and constraints. No separate environment. |
+| Delivery | One self-contained script, `Batch_Rolling_Ball_Background.py`, installed as an official (trusted) OMERO script in the server's `lib/scripts/` folder, through OMERO.web's Upload Script, a file copy or the CLI. No helper modules. |
+| Runtime | The OMERO server's own Python (3.11, NumPy 2.4.6). SciPy 1.17.1 is added to it as a pinned add-on, following [../README.md](../README.md). No separate environment. |
 | Input | Image IDs, or exactly one dataset ID. An optional wildcard filters by full image name. |
 | Channels | Up to 6. One radius field per channel, in stored channel order. Every channel needs a value; 0 means copy unchanged. |
 | Batch | Same channel count and same ordered (trimmed) channel names across all images. X/Y/Z/T may vary. |
