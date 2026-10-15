@@ -9,7 +9,8 @@ The server needs no conda. The `omero` conda environment is used only on your Ma
 
 | Script | Purpose | Extra packages |
 |---|---|---|
-| [subtract-background/](subtract-background/README.md) | Batch rolling-ball background subtraction | scipy |
+| [subtract-background/](subtract-background/README.md) | Rolling-ball background subtraction | scipy |
+| [z-project/](z-project/README.md) | Z-projection (max, sum or average intensity) | none |
 | [Env_Check.py](Env_Check.py) | Reports the script interpreter, import path and package versions | none |
 
 ## Server environment
@@ -43,14 +44,15 @@ OMERO treats every `.py` file under the server's `lib/scripts/` folder as an off
 # On your Mac: copy the files to the server
 scp omero/server-side-script/Env_Check.py \
     omero/server-side-script/requirements-scripts.txt \
-    omero/server-side-script/subtract-background/Batch_Rolling_Ball_Background.py \
+    omero/server-side-script/subtract-background/Rolling_Ball_Background.py \
+    omero/server-side-script/z-project/Z_Projection.py \
     USER@OMERO_HOST:/tmp/
 
 # On the server: the folder name becomes the group name in the Scripts menu
 SCRIPTS=/opt/omero/server/OMERO.server/lib/scripts/jefflee_lab
 sudo install -d -o omero-server -g omero-server "$SCRIPTS"
 sudo install -m 644 -o omero-server -g omero-server \
-    /tmp/Env_Check.py /tmp/Batch_Rolling_Ball_Background.py "$SCRIPTS"/
+    /tmp/Env_Check.py /tmp/Rolling_Ball_Background.py /tmp/Z_Projection.py "$SCRIPTS"/
 ```
 
 Then open the **Scripts** menu in OMERO.web. Each listing makes the server rescan `lib/scripts`, so the new scripts appear without a restart.
