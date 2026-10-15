@@ -1,23 +1,23 @@
-# Batch rolling-ball background subtraction (OMERO script)
+# Rolling-ball background subtraction (OMERO script)
 
-[Batch_Rolling_Ball_Background.py](Batch_Rolling_Ball_Background.py) is a single-file OMERO script. It applies the lab's pinned ImageJ rolling-ball port to raw image planes, with one radius per channel. It writes the results as new images into one dataset and never changes the originals. The contract is in [spec.md](spec.md).
+[Rolling_Ball_Background.py](Rolling_Ball_Background.py) is a single-file OMERO script. It applies the lab's pinned ImageJ rolling-ball port to raw image planes, with one radius per channel. It writes the results as new images into one dataset and never changes the originals. The contract is in [spec.md](spec.md).
 
 **Status:** the local checks (`test_local.py`) pass with the server's versions of Python (3.11), NumPy (2.4.6) and SciPy (1.17.1). The script has **not yet been run on the OMERO server**; see [Live check](#live-check).
 
 ## Using it in OMERO.web
 
-1. Select images, or one dataset, then choose **Scripts → Batch_Rolling_Ball_Background**.
+1. Select images, or one dataset, then choose **Scripts → Rolling_Ball_Background**.
 2. Enter a radius for each channel. `Channel_1_Radius` is the first channel, and radii are in XY pixels.
    - **0 keeps that channel unchanged. If every radius is 0, the image is copied.**
    - Leave the fields blank for channels the images don't have.
 3. Optionally choose a `Z_Projection` (default `Off`); see [Z projection](#z-projection).
 4. Choose where results go: **either** `Output_Dataset_ID` (an existing dataset) **or** `New_Dataset_Name`.
-5. Run with `Dry_Run` ticked, which is the default. Check the message: it lists each channel's name with its radius, the Z projection, and every planned output name.
-6. Untick `Dry_Run` and run again with the same settings.
+5. Optionally tick `Dry_Run` (off by default) to check first. The message then lists each channel's name with its radius, the Z projection, and every planned output name, and nothing is written.
+6. Run with `Dry_Run` unticked to process.
 
 Rules:
 
-- **Matching channels:** every image in a run must have the same channels, with the same names in the same order, up to 6. X/Y/Z/T sizes may differ.
+- **Matching channels:** every image in a run must have the same channels, with the same names in the same order, up to 8. X/Y/Z/T sizes may differ.
 - **Pixel types:** uint8, uint16 and float32. Each output keeps its source's type.
 - **Image size:** very large images that OMERO stores as pyramids are rejected, because the script reads whole planes.
 - **Checks first:** everything is checked before anything is written.
@@ -67,7 +67,7 @@ The server needs no conda; everything runs in the OMERO server's own Python. Sci
 
 1. In OMERO.web, open **Scripts → Upload Script** and upload `Env_Check.py`, then this script, into one folder such as `/jefflee_lab`. [Installing a script](../README.md#installing-a-script) has the details and the other ways to install.
 2. Run **Env_Check** from the Scripts menu. Confirm that it reports SciPy 1.17.1 and NumPy 2.4.6, and note the `omero-py` version.
-3. Open **Batch_Rolling_Ball_Background** from the Scripts menu and check that it shows the 13 fields.
+3. Open **Rolling_Ball_Background** from the Scripts menu and check that it shows the 15 fields.
 
 To install a new version, upload the new file with the same name into the same folder. OMERO.web offers **Replace script**, and the script keeps its ID.
 
@@ -85,7 +85,7 @@ import getpass, importlib.util
 import numpy as np
 from omero.gateway import BlitzGateway
 
-spec = importlib.util.spec_from_file_location("bgs", "Batch_Rolling_Ball_Background.py")
+spec = importlib.util.spec_from_file_location("bgs", "Rolling_Ball_Background.py")
 bgs = importlib.util.module_from_spec(spec); spec.loader.exec_module(bgs)
 conn = BlitzGateway(input("User: "), getpass.getpass(), host="OMERO_HOST", port=4064, secure=True)
 conn.connect()

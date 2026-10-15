@@ -1,6 +1,6 @@
-# OMERO batch rolling-ball background subtraction: specification v0.3
+# OMERO rolling-ball background subtraction: specification v0.4
 
-Revised 14 October 2026. v0.3 adds the optional Z max-intensity projection (§2).
+Revised 15 October 2026. v0.4 allows up to 8 channels and turns the dry run off by default. v0.3 added the optional Z max-intensity projection (§2).
 
 This revision replaces the v0.1 specification, which called for an uploaded entry script, an external adapter package, a separate uv worker environment and journal-based resume. That design and its implementation are kept in git commit `84108b4`.
 
@@ -10,17 +10,17 @@ Scientific validation was done in the owner's RDI-calculator project. It is acce
 
 | Area | Requirement |
 |---|---|
-| Delivery | One self-contained script, `Batch_Rolling_Ball_Background.py`, installed as an official (trusted) OMERO script in the server's `lib/scripts/` folder, through OMERO.web's Upload Script, a file copy or the CLI. No helper modules. |
+| Delivery | One self-contained script, `Rolling_Ball_Background.py`, installed as an official (trusted) OMERO script in the server's `lib/scripts/` folder, through OMERO.web's Upload Script, a file copy or the CLI. No helper modules. |
 | Runtime | The OMERO server's own Python (3.11, NumPy 2.4.6). SciPy 1.17.1 is added to it as a pinned add-on, following [../README.md](../README.md). No separate environment. |
 | Input | Image IDs, or exactly one dataset ID. An optional wildcard filters by full image name. |
-| Channels | Up to 6. One radius field per channel, in stored channel order. Every channel needs a value; 0 means copy unchanged. |
+| Channels | Up to 8. One radius field per channel, in stored channel order. Every channel needs a value; 0 means copy unchanged. |
 | Batch | Same channel count and same ordered (trimmed) channel names across all images. X/Y/Z/T may vary. |
 | Algorithm | The pinned port, unchanged. Presmooth on, automatic shrink, dark background, corrected negatives clipped to 0. |
 | Z projection | Optional, off by default: a max-intensity projection along Z, either before or after subtraction. The output then has one Z-plane. |
 | Pixel types | uint8, uint16, float32. Each output keeps its source's type. |
 | Destination | Exactly one: an existing dataset ID, or a new dataset name. |
 | Naming | Fixed: `{basename}_bgs-{r1}-…-{rC}.tif` |
-| Safety | A dry run (the default) and a full metadata check before any write. Source images are never modified. |
+| Safety | An optional dry run (off by default) and a full metadata check before any write. Source images are never modified. |
 | Failures | A failed image does not stop the batch. Its partial output is deleted, and the message lists the failure. |
 | Provenance | A description and a key-value annotation on every output. |
 
@@ -49,11 +49,11 @@ Scientific validation was done in the owner's RDI-calculator project. It is acce
 | `Data_Type` | Image \| Dataset, default Image | What `IDs` refers to |
 | `IDs` | List of Long, required | Image IDs, or exactly one dataset ID |
 | `Name_Filter` | String, optional | Wildcard (`*`, `?`) on the full name; blank includes all |
-| `Channel_1_Radius` … `Channel_6_Radius` | Double ≥ 0, optional, **no default** | Radius per channel; 0 keeps the channel unchanged |
+| `Channel_1_Radius` … `Channel_8_Radius` | Double ≥ 0, optional, **no default** | Radius per channel; 0 keeps the channel unchanged |
 | `Z_Projection` | Off \| Max projection, then subtract \| Subtract, then max projection; default Off | Optional max-intensity projection along Z, and its order |
 | `Output_Dataset_ID` | Long, optional | Existing destination dataset |
 | `New_Dataset_Name` | String, optional | Create a destination dataset with this name |
-| `Dry_Run` | Bool, default True | Check and list the plan without writing |
+| `Dry_Run` | Bool, default False | Check and list the plan without writing |
 
 A blank radius means "not set" and is never treated as 0. The script description and each radius field's help both state that 0 keeps the channel unchanged.
 
@@ -64,7 +64,7 @@ The run fails with all errors listed, and nothing written, if any of these is tr
 - An ID is not found or not accessible.
 - No image matches.
 - A pixel type is unsupported.
-- An image has more than 6 channels.
+- An image has more than 8 channels.
 - An image's channel names or order differ from those of the lowest-ID image.
 - An image needs a pixel pyramid, which rules out whole-plane reads.
 - A channel has no radius, or a radius is given for a channel the images lack.

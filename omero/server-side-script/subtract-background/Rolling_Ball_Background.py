@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Batch rolling-ball background subtraction for OMERO images.
+"""Rolling-ball background subtraction for OMERO images.
 
 Reads raw planes, applies the lab's pinned ImageJ rolling-ball port with one
 radius per channel, and writes new images into one explicitly chosen dataset.
@@ -25,8 +25,8 @@ try:
 except ImportError:  # reported when the script runs, so it still lists in OMERO.web
     ndi = None
 
-VERSION = "0.3.0"
-MAX_CHANNELS = 6
+VERSION = "0.4.0"
+MAX_CHANNELS = 8
 MAX_NAME_LENGTH = 255
 MAX_MESSAGE_LINES = 50
 NAMESPACE = "org.jeffleelab.omero.bgsub"
@@ -485,7 +485,7 @@ def run(conn, params):
         return "Nothing was written.\n" + str(exc), {}
     mapping = channel_mapping(names, radii)
     projection = params.get("Z_Projection", PROJECTION_OFF)
-    if params.get("Dry_Run", True):
+    if params.get("Dry_Run", False):
         target = f"dataset {dataset.getId()} '{dataset.getName()}'" if dataset else f"new dataset '{new_name}'"
         lines = [f"Dry run: {len(plan)} image(s) -> {target}.", f"Channels: {mapping}.",
                  f"Z projection: {projection}."]
@@ -537,21 +537,20 @@ def parameters():
                      description="Put the results in this existing dataset..."),
         scripts.String("New_Dataset_Name", grouping=f"{6 + MAX_CHANNELS:02d}",
                        description="...or create a new dataset with this name. Give exactly one of the two."),
-        scripts.Bool("Dry_Run", grouping=f"{7 + MAX_CHANNELS:02d}", default=True,
-                     description="Check inputs and list planned outputs without writing anything. "
-                                 "Untick to process."),
+        scripts.Bool("Dry_Run", grouping=f"{7 + MAX_CHANNELS:02d}", default=False,
+                     description="Check inputs and list planned outputs without writing anything."),
     ]
     return params
 
 
 def run_script():
     client = scripts.client(
-        "Batch_Rolling_Ball_Background.py",
+        "Rolling_Ball_Background.py",
         "Rolling-ball background subtraction (ImageJ port) on raw planes, one radius per channel. "
         "Set a radius to 0 to keep that channel unchanged; if all radii are 0 the image is copied. "
         "Results are new images named {basename}_bgs-{r1}-{r2}-....tif in one dataset; "
         "originals are not changed. Z_Projection optionally max-projects along Z before or after "
-        "subtraction (_mip in the name marks where). " + SETTINGS + ". Run with Dry_Run first.",
+        "subtraction (_mip in the name marks where). " + SETTINGS + ". Tick Dry_Run to check the plan without writing.",
         *parameters(),
         version=VERSION, authors=["Jeff Lee Lab"], institutions=["Jeff Lee Lab"], namespaces=[NAMESPACE])
     try:

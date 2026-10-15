@@ -1,4 +1,4 @@
-"""Local checks for Batch_Rolling_Ball_Background.py; no OMERO server needed.
+"""Local checks for Rolling_Ball_Background.py; no OMERO server needed.
 
 Run from this folder in the `omero` conda env (needs SciPy):
     python -m unittest test_local -v
@@ -17,7 +17,7 @@ from omero.rtypes import unwrap
 
 sys.dont_write_bytecode = True  # keep __pycache__ out of the pinned algorithm's folder
 HERE = Path(__file__).resolve().parent
-SCRIPT = HERE / "Batch_Rolling_Ball_Background.py"
+SCRIPT = HERE / "Rolling_Ball_Background.py"
 PINNED = HERE.parents[2] / "people/AlfredoCastello/Zhiling-Marko-HIV/src/imagej_rolling_ball.py"
 
 
@@ -199,12 +199,12 @@ class Dialog(unittest.TestCase):
     params = {p.name(): p for p in script.parameters()}
 
     def test_parameter_names(self):
-        expected = (["Data_Type", "IDs", "Name_Filter"] + [f"Channel_{i}_Radius" for i in range(1, 7)]
+        expected = (["Data_Type", "IDs", "Name_Filter"] + [f"Channel_{i}_Radius" for i in range(1, 9)]
                     + ["Z_Projection", "Output_Dataset_ID", "New_Dataset_Name", "Dry_Run"])
         self.assertEqual(list(self.params), expected)
 
     def test_radius_is_optional_without_default(self):
-        for i in range(1, 7):
+        for i in range(1, 9):
             radius = self.params[f"Channel_{i}_Radius"]
             self.assertTrue(radius.optional)
             self.assertFalse(radius.useDefault)
@@ -216,9 +216,9 @@ class Dialog(unittest.TestCase):
         self.assertEqual(unwrap(projection.prototype), "Off")
         self.assertEqual(unwrap(projection.values), list(script.PROJECTIONS))
 
-    def test_dry_run_is_default(self):
+    def test_dry_run_is_off_by_default(self):
         self.assertTrue(self.params["Dry_Run"].useDefault)
-        self.assertIs(unwrap(self.params["Dry_Run"].prototype), True)
+        self.assertIs(unwrap(self.params["Dry_Run"].prototype), False)
 
 
 class Preflight(unittest.TestCase):
