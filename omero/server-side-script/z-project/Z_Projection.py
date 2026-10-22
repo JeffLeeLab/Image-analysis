@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 """Z-projection (max, sum or average intensity) for OMERO images.
 
-Reads raw planes, projects each channel and timepoint along Z, and writes new
-images into one explicitly chosen dataset. Source images are never modified.
+Reads raw planes, projects each channel and timepoint along Z (all planes, or an
+optional 1-based Z range), and writes new images into one explicitly chosen
+dataset. Source images are never modified.
 Needs only NumPy, which OMERO itself uses (see ../README.md).
 """
 from __future__ import annotations
@@ -16,7 +17,7 @@ import omero.scripts as scripts
 from omero.gateway import BlitzGateway, DatasetWrapper, MapAnnotationWrapper
 from omero.rtypes import rint, rlong, robject, rstring
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 MAX_NAME_LENGTH = 255
 MAX_MESSAGE_LINES = 50
 NAMESPACE = "org.jeffleelab.omero.zproject"
@@ -28,8 +29,45 @@ SUFFIXES = {MAX_METHOD: "_mip", SUM_METHOD: "_sum", AVG_METHOD: "_avg"}
 NUMPY_TYPES = {"uint8": np.uint8, "uint16": np.uint16, "uint32": np.uint32, "float": np.float32}
 
 
-def output_name(name, method):
-    """Fixed output name: {basename}_mip.tif, _sum.tif or _avg.tif."""
+def requested_z(params):
+    """(Z_Start, Z_End) as given: 1-based and inclusive, None where blank."""
+    start, end = params.get("Z_Start"), params.get("Z_End")
+    for field, value in (("Z_Start", start), ("Z_End", end)):
+        if value is not None and value < 1:
+            raise ValueError(f"{field} must be 1 or more (Z-planes are numbered from 1)")
+    if start is not None and end is not None and start > end:
+        raise ValueError(f"Z_Start ({start}) is after Z_End ({end})")
+    return start, end
+
+
+def z_text(requested):
+    """The requested Z-planes for messages: all, 3-15, 5-last or 1-15."""
+    start, end = requested
+    if start is None and end is None:
+        return "all"
+    return f"{start or 1}-{end or 'last'}"
+
+
+def image_z_range(requested, size_z):
+    """None for the whole stack, else this image's 1-based inclusive (start, end).
+
+    A blank end is open: Z_Start alone runs to the image's last plane, Z_End alone starts at plane 1.
+    """
+    start, end = requested
+    if start is None and end is None:
+        return None
+    if (start or 1) > size_z or (end or 1) > size_z:
+        raise ValueError(f"Z-planes {z_text(requested)} do not fit its {size_z} Z-planes")
+    return start or 1, end or size_z
+
+
+def z_indices(z_range, size_z):
+    """0-based source planes to project."""
+    return range(size_z) if z_range is None else range(z_range[0] - 1, z_range[1])
+
+
+def output_name(name, method, z_range=None):
+    """Output name: {basename}_mip.tif, _sum.tif or _avg.tif, plus the Z range if given (_mip3-15.tif)."""
     base = name
     for suffix in (".ome.tiff", ".ome.tif", ".tiff", ".tif"):
         if name.lower().endswith(suffix):
@@ -41,7 +79,8 @@ def output_name(name, method):
             base = name[:dot]
     if not base:
         raise ValueError(f"Image name '{name}' has an empty basename")
-    result = base + SUFFIXES[method] + ".tif"
+    span = "" if z_range is None else f"{z_range[0]}-{z_range[1]}"
+    result = base + SUFFIXES[method] + span + ".tif"
     if len(result) > MAX_NAME_LENGTH:
         raise ValueError(f"Output name for '{name}' exceeds {MAX_NAME_LENGTH} characters")
     return result
@@ -82,11 +121,11 @@ def project(planes, method, out_type):
     return result.astype(out_dtype, copy=False)
 
 
-def output_planes(get_plane, size_z, size_c, size_t, method, out_type):
-    """Yield (z, c, t, plane) for the output, which has one z-plane."""
+def output_planes(get_plane, z_planes, size_c, size_t, method, out_type):
+    """Yield (z, c, t, plane) for the output, which has one z-plane. z_planes are 0-based source planes."""
     for c in range(size_c):
         for t in range(size_t):
-            yield 0, c, t, project((get_plane(z, c, t) for z in range(size_z)), method, out_type)
+            yield 0, c, t, project((get_plane(z, c, t) for z in z_planes), method, out_type)
 
 
 def pixel_type(image):
@@ -124,16 +163,21 @@ def collect_images(conn, params):
     return sorted({image.getId(): image for image in images}.values(), key=lambda image: image.getId())
 
 
-def plan_batch(images, method):
-    """Check the whole batch before any write.
+def plan_batch(images, method, requested=(None, None)):
+    """Check the whole batch before any write. A Z range that does not fit any one image stops the batch.
 
-    Returns ([(image, output name, output pixel type)], [skipped single-Z image labels]).
+    Returns ([(image, output name, output pixel type, image Z range)], [skipped single-Z image labels]).
     """
     errors, plan, skipped = [], [], []
     for image in images:
         label = f"{image.getId()} {image.getName()}"
         if image.getSizeZ() < 2:
             skipped.append(label)
+            continue
+        try:
+            z_range = image_z_range(requested, image.getSizeZ())
+        except ValueError as exc:
+            errors.append(f"Image {label}: {exc}")
             continue
         source_type = pixel_type(image)
         if source_type not in SUPPORTED_TYPES:
@@ -143,7 +187,8 @@ def plan_batch(images, method):
             errors.append(f"Image {label}: too large for whole-plane processing")
             continue
         try:
-            plan.append((image, output_name(image.getName(), method), output_pixel_type(source_type, method)))
+            plan.append((image, output_name(image.getName(), method, z_range),
+                         output_pixel_type(source_type, method), z_range))
         except ValueError as exc:
             errors.append(str(exc))
     if errors:
@@ -169,14 +214,18 @@ def resolve_destination(conn, params):
     return dataset, None
 
 
-def add_provenance(conn, new_image, source, method, out_type):
+def add_provenance(conn, new_image, source, method, out_type, z_range):
+    planes = z_indices(z_range, source.getSizeZ())
     annotation = MapAnnotationWrapper(conn)
     annotation.setNs(NAMESPACE)
     annotation.setValue([
         ["source_image_id", str(source.getId())],
         ["source_image_name", source.getName()],
         ["projection", method],
-        ["z_planes", str(source.getSizeZ())],
+        ["z_start", str(planes.start + 1)],
+        ["z_end", str(planes.stop)],
+        ["z_planes", str(len(planes))],
+        ["source_size_z", str(source.getSizeZ())],
         ["source_pixel_type", pixel_type(source)],
         ["output_pixel_type", out_type],
         ["script_version", VERSION],
@@ -186,12 +235,13 @@ def add_provenance(conn, new_image, source, method, out_type):
     new_image.linkAnnotation(annotation)
 
 
-def process_image(conn, image, method, name, out_type, dataset):
-    """Write one Z-projection of image into dataset."""
+def process_image(conn, image, method, name, out_type, z_range, dataset):
+    """Write one Z-projection of image into dataset, over z_range (None for the whole stack)."""
     pixels_service = conn.getPixelsService()
     update = conn.getUpdateService()
     size_z, size_c, size_t = image.getSizeZ(), image.getSizeC(), image.getSizeT()
     source_type = pixel_type(image)
+    span = f"{size_z} Z-planes" if z_range is None else f"Z-planes {z_range[0]}-{z_range[1]} of {size_z}"
     # Copies dimensions, pixel type, physical sizes and channel metadata, not pixels.
     new_id = pixels_service.copyAndResizeImage(
         image.getId(), rint(image.getSizeX()), rint(image.getSizeY()), rint(1), rint(size_t),
@@ -200,7 +250,7 @@ def process_image(conn, image, method, name, out_type, dataset):
         new_image = conn.getObject("Image", new_id)
         new_image._obj.setName(rstring(name))
         new_image._obj.setDescription(rstring(
-            f"{method} Z-projection of image {image.getId()} ({image.getName()}) over {size_z} Z-planes. "
+            f"{method} Z-projection of image {image.getId()} ({image.getName()}) over {span}. "
             f"Pixel type {source_type} -> {out_type}."))
         update.saveObject(new_image._obj, conn.SERVICE_OPTS)
         if out_type != source_type:
@@ -213,8 +263,8 @@ def process_image(conn, image, method, name, out_type, dataset):
         store = conn.c.sf.createRawPixelsStore()
         try:
             store.setPixelsId(new_image.getPixelsId(), True, conn.SERVICE_OPTS)
-            for z, c, t, result in output_planes(image.getPrimaryPixels().getPlane, size_z, size_c, size_t,
-                                                 method, out_type):
+            for z, c, t, result in output_planes(image.getPrimaryPixels().getPlane, z_indices(z_range, size_z),
+                                                 size_c, size_t, method, out_type):
                 wire = np.ascontiguousarray(result, dtype=result.dtype.newbyteorder(">"))
                 store.setPlane(wire.tobytes(), z, c, t, conn.SERVICE_OPTS)
                 ranges[c] = [min(ranges[c][0], float(result.min())),
@@ -223,7 +273,7 @@ def process_image(conn, image, method, name, out_type, dataset):
             store.close(conn.SERVICE_OPTS)
         for c, (low, high) in enumerate(ranges):
             pixels_service.setChannelGlobalMinMax(new_image.getPixelsId(), c, low, high, conn.SERVICE_OPTS)
-        add_provenance(conn, new_image, image, method, out_type)
+        add_provenance(conn, new_image, image, method, out_type, z_range)
         # Link last, so only finished images appear in the dataset.
         link = omero.model.DatasetImageLinkI()
         link.setParent(omero.model.DatasetI(dataset.getId(), False))
@@ -252,10 +302,11 @@ def run(conn, params):
     """Returns (message, {output name: OMERO model object})."""
     method = params.get("Projection", MAX_METHOD)
     try:
+        requested = requested_z(params)
         images = collect_images(conn, params)
         if not images:
             return "No images matched the selection and name filter. Nothing was written.", {}
-        plan, skipped = plan_batch(images, method)
+        plan, skipped = plan_batch(images, method, requested)
         if not plan:
             return "\n".join(["No image has more than one Z-plane. Nothing was written."]
                              + skipped_lines(skipped)), {}
@@ -264,24 +315,25 @@ def run(conn, params):
         return "Nothing was written.\n" + str(exc), {}
     if params.get("Dry_Run", False):
         target = f"dataset {dataset.getId()} '{dataset.getName()}'" if dataset else f"new dataset '{new_name}'"
-        lines = [f"Dry run: {len(plan)} image(s) -> {target}.", f"Projection: {method}."]
+        lines = [f"Dry run: {len(plan)} image(s) -> {target}.", f"Projection: {method}.",
+                 f"Z-planes: {z_text(requested)}."]
         lines += limited([f"{image.getId()} {image.getName()} -> {name} ({out_type})"
-                          for image, name, out_type in plan])
+                          for image, name, out_type, _ in plan])
         return "\n".join(lines + skipped_lines(skipped) + ["Untick Dry_Run to process."]), {}
     if dataset is None:
         dataset = DatasetWrapper(conn, obj=omero.model.DatasetI())
         dataset.setName(rstring(new_name))
         dataset.save()
     done, failed = [], []
-    for index, (image, name, out_type) in enumerate(plan, start=1):
+    for index, (image, name, out_type, z_range) in enumerate(plan, start=1):
         print(f"Image {index}/{len(plan)}: {image.getId()} {image.getName()}", flush=True)
         try:
-            done.append(process_image(conn, image, method, name, out_type, dataset))
+            done.append(process_image(conn, image, method, name, out_type, z_range, dataset))
         except Exception as exc:
             failed.append(f"{image.getId()} {image.getName()}: {type(exc).__name__}: {exc}")
             print(failed[-1], flush=True)
     lines = [f"{len(done)} of {len(plan)} image(s) written to dataset {dataset.getId()} '{dataset.getName()}'.",
-             f"Projection: {method}."]
+             f"Projection: {method}.", f"Z-planes: {z_text(requested)}."]
     if failed:
         lines += ["Failed (no output kept):"] + limited(failed)
     lines += skipped_lines(skipped)
@@ -305,11 +357,17 @@ def parameters():
                        values=[rstring(m) for m in METHODS],
                        description="Max keeps the pixel type. Sum gives uint32 (float stays float). "
                                    "Average gives float."),
-        scripts.Long("Output_Dataset_ID", grouping="05", min=1,
+        scripts.Int("Z_Start", grouping="05", min=1,
+                    description="Optional first Z-plane to project (1-based). Blank starts at plane 1. "
+                                "Leave both Z fields blank to project the whole stack."),
+        scripts.Int("Z_End", grouping="06", min=1,
+                    description="Optional last Z-plane to project (included). Blank ends at each image's "
+                                "last plane. A range that does not fit every image stops the run."),
+        scripts.Long("Output_Dataset_ID", grouping="07", min=1,
                      description="Put the results in this existing dataset..."),
-        scripts.String("New_Dataset_Name", grouping="06",
+        scripts.String("New_Dataset_Name", grouping="08",
                        description="...or create a new dataset with this name. Give exactly one of the two."),
-        scripts.Bool("Dry_Run", grouping="07", default=False,
+        scripts.Bool("Dry_Run", grouping="09", default=False,
                      description="Check inputs and list planned outputs without writing anything."),
     ]
 
@@ -319,7 +377,8 @@ def run_script():
         "Z_Projection.py",
         "Projects each image along Z (max, sum or average intensity) for every channel and timepoint. "
         "Results are new images named {basename}_mip.tif, _sum.tif or _avg.tif in one dataset; "
-        "originals are not changed. Max keeps the pixel type; Sum gives uint32 (float stays float); "
+        "originals are not changed. Z_Start/Z_End optionally limit the Z-planes (1-based), "
+        "e.g. {basename}_mip3-15.tif. Max keeps the pixel type; Sum gives uint32 (float stays float); "
         "Average gives float. Images with one Z-plane are skipped.",
         *parameters(),
         version=VERSION, authors=["Jeff Lee Lab"], institutions=["Jeff Lee Lab"], namespaces=[NAMESPACE])

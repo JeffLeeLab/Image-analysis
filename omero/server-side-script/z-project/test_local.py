@@ -77,9 +77,43 @@ class Naming(unittest.TestCase):
                                ("field.001.tif", "field.001_mip.tif"), ("noext", "noext_mip.tif")]:
             self.assertEqual(script.output_name(name, MAX), expected)
 
+    def test_z_range_in_name(self):
+        self.assertEqual(script.output_name("image_001.ome.tif", MAX, (3, 15)), "image_001_mip3-15.tif")
+        self.assertEqual(script.output_name("sample.tiff", SUM, (7, 7)), "sample_sum7-7.tif")
+
     def test_rejects_bad_input(self):
         self.assertRaises(ValueError, script.output_name, ".tif", MAX)
         self.assertRaises(ValueError, script.output_name, "a" * 250 + ".tif", MAX)
+        self.assertRaises(ValueError, script.output_name, "a" * 245 + ".tif", MAX, (100, 200))
+
+
+class ZRange(unittest.TestCase):
+    def test_requested(self):
+        self.assertEqual(script.requested_z({}), (None, None))
+        self.assertEqual(script.requested_z({"Z_Start": 3, "Z_End": 15}), (3, 15))
+        self.assertEqual(script.requested_z({"Z_Start": 7, "Z_End": 7}), (7, 7))
+
+    def test_requested_rejects_bad_input(self):
+        for params in ({"Z_Start": 15, "Z_End": 3}, {"Z_Start": 0}, {"Z_End": 0}):
+            self.assertRaises(ValueError, script.requested_z, params)
+
+    def test_per_image_range(self):
+        for requested, expected in [((None, None), None), ((3, 15), (3, 15)), ((5, None), (5, 30)),
+                                    ((None, 4), (1, 4)), ((30, None), (30, 30)), ((1, 30), (1, 30))]:
+            self.assertEqual(script.image_z_range(requested, 30), expected)
+
+    def test_range_beyond_stack_rejected(self):
+        for requested in ((3, 31), (31, None), (None, 31), (31, 40)):
+            self.assertRaises(ValueError, script.image_z_range, requested, 30)
+
+    def test_indices_are_zero_based(self):
+        self.assertEqual(script.z_indices(None, 5), range(5))
+        self.assertEqual(script.z_indices((3, 15), 30), range(2, 15))
+
+    def test_text(self):
+        for requested, expected in [((None, None), "all"), ((3, 15), "3-15"), ((5, None), "5-last"),
+                                    ((None, 4), "1-4")]:
+            self.assertEqual(script.z_text(requested), expected)
 
 
 class PixelTypes(unittest.TestCase):
@@ -154,18 +188,34 @@ class Project(unittest.TestCase):
 class OutputPlanes(unittest.TestCase):
     def test_one_plane_per_channel_and_timepoint(self):
         stack = np.random.default_rng(1).integers(0, 4000, (4, 2, 3, 8, 8)).astype(np.uint16)  # z, c, t, y, x
-        planes = list(script.output_planes(lambda z, c, t: stack[z, c, t], *stack.shape[:3], SUM, "uint32"))
+        planes = list(script.output_planes(lambda z, c, t: stack[z, c, t], range(4), 2, 3, SUM, "uint32"))
         self.assertEqual([(z, c, t) for z, c, t, _ in planes], [(0, c, t) for c in range(2) for t in range(3)])
         for _, c, t, plane in planes:
             self.assertTrue(np.array_equal(plane, stack[:, c, t].sum(axis=0)))
+
+    def test_only_chosen_planes(self):
+        stack = np.random.default_rng(2).integers(0, 4000, (6, 1, 1, 8, 8)).astype(np.uint16)
+        for method, out_type, expected in [(MAX, "uint16", stack[1:4, 0, 0].max(axis=0)),
+                                           (SUM, "uint32", stack[1:4, 0, 0].sum(axis=0)),
+                                           (AVG, "float", stack[1:4, 0, 0].mean(axis=0, dtype=np.float64))]:
+            (_, _, _, plane), = script.output_planes(lambda z, c, t: stack[z, c, t], script.z_indices((2, 4), 6),
+                                                     1, 1, method, out_type)
+            self.assertTrue(np.array_equal(plane, expected.astype(plane.dtype)))
 
 
 class Dialog(unittest.TestCase):
     params = {p.name(): p for p in script.parameters()}
 
     def test_parameter_names(self):
-        self.assertEqual(list(self.params), ["Data_Type", "IDs", "Name_Filter", "Projection",
+        self.assertEqual(list(self.params), ["Data_Type", "IDs", "Name_Filter", "Projection", "Z_Start", "Z_End",
                                              "Output_Dataset_ID", "New_Dataset_Name", "Dry_Run"])
+
+    def test_z_range_is_blank_by_default(self):
+        for name in ("Z_Start", "Z_End"):
+            param = self.params[name]
+            self.assertTrue(param.optional)
+            self.assertFalse(param.useDefault)
+            self.assertEqual(unwrap(param.min), 1)
 
     def test_projection_is_max_by_default(self):
         projection = self.params["Projection"]
@@ -193,8 +243,42 @@ class Preflight(unittest.TestCase):
         self.assertEqual(outputs, {})
         self.assertIn("2 image(s) -> dataset 9 'out'", message)
         self.assertIn("Projection: Max intensity.", message)
+        self.assertIn("Z-planes: all.", message)
         self.assertLess(message.index("1 a.tif -> a_mip.tif (uint8)"),
                         message.index("2 b.ome.tif -> b_mip.tif (uint16)"))
+
+    def test_dry_run_with_z_range(self):
+        message, _ = self.run_with(Z_Start=2, Z_End=4)
+        self.assertIn("Z-planes: 2-4.", message)
+        self.assertIn("1 a.tif -> a_mip2-4.tif (uint8)", message)
+        self.assertIn("2 b.ome.tif -> b_mip2-4.tif (uint16)", message)
+
+    def test_open_ended_range_per_image(self):
+        self.images[0].size_z = 8
+        message, _ = self.run_with(Z_Start=3)
+        self.assertIn("Z-planes: 3-last.", message)
+        self.assertIn("1 a.tif -> a_mip3-5.tif", message)
+        self.assertIn("2 b.ome.tif -> b_mip3-8.tif", message)
+
+    def test_range_beyond_any_image_stops_batch(self):
+        self.images += [FakeImage(3, "c.tif", size_z=3), FakeImage(4, "d.tif", size_z=2)]
+        message, outputs = self.run_with(IDs=[1, 2, 3, 4], Z_Start=2, Z_End=4, Dry_Run=False)
+        self.assertEqual(outputs, {})
+        self.assertIn("Nothing was written", message)
+        self.assertIn("Image 3 c.tif: Z-planes 2-4 do not fit its 3 Z-planes", message)
+        self.assertIn("Image 4 d.tif: Z-planes 2-4 do not fit its 2 Z-planes", message)
+
+    def test_single_z_skipped_not_rejected_with_z_range(self):
+        self.images[1].size_z = 1
+        message, _ = self.run_with(Z_Start=2, Z_End=4)
+        self.assertIn("1 image(s)", message)
+        self.assertIn("Skipped (only one Z-plane):\n1 a.tif", message)
+
+    def test_start_after_end_rejected(self):
+        message, outputs = self.run_with(Z_Start=4, Z_End=2, Dry_Run=False)
+        self.assertEqual(outputs, {})
+        self.assertIn("Nothing was written", message)
+        self.assertIn("Z_Start (4) is after Z_End (2)", message)
 
     def test_dry_run_with_sum(self):
         message, _ = self.run_with(Projection=SUM, Output_Dataset_ID=None, New_Dataset_Name="sums")

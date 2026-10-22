@@ -1,6 +1,6 @@
 # Z-projection (OMERO script)
 
-[Z_Projection.py](Z_Projection.py) is a single-file OMERO script. It projects each image along Z using maximum, sum or average intensity, for every channel and timepoint. It writes the results as new images into one dataset and never changes the originals. It needs only NumPy, which every OMERO server already has.
+[Z_Projection.py](Z_Projection.py) is a single-file OMERO script. It projects each image along Z using maximum, sum or average intensity, for every channel and timepoint. By default it uses every Z-plane; you can optionally give a Z range instead. It writes the results as new images into one dataset and never changes the originals. It needs only NumPy, which every OMERO server already has.
 
 **Status:** the local checks (`test_local.py`) pass with the server's versions of Python (3.11) and NumPy (2.4.6). The script has **not yet been run on the OMERO server**; see [Live check](#live-check).
 
@@ -8,9 +8,10 @@
 
 1. Select images, or one dataset, then choose **Scripts → Z_Projection**.
 2. Choose a `Projection`. The default is `Max intensity`.
-3. Choose where results go: **either** `Output_Dataset_ID` (an existing dataset) **or** `New_Dataset_Name`.
-4. Optionally tick `Dry_Run` (off by default). The message then lists every planned output name and pixel type, and nothing is written.
-5. Run.
+3. Optionally set `Z_Start` and/or `Z_End` to project only some Z-planes. Leave both blank (the default) to project the whole stack. See [Z range](#z-range).
+4. Choose where results go: **either** `Output_Dataset_ID` (an existing dataset) **or** `New_Dataset_Name`.
+5. Optionally tick `Dry_Run` (off by default). The message then lists every planned output name and pixel type, and nothing is written.
+6. Run.
 
 Rules:
 
@@ -22,6 +23,25 @@ Rules:
 - **Failures:** if one image fails during processing, its partial output is deleted and the rest continue. The message lists the failures.
 - **`Name_Filter`** is an optional wildcard on the full image name, for example `*.tif`. Earlier `_mip`/`_sum`/`_avg` results have one Z-plane, so they are skipped anyway.
 - **Cancelling** a running job can leave the image being written as a partial image under *Orphaned Images*. Delete it.
+
+## Z range
+
+`Z_Start` and `Z_End` are numbered from 1 and both ends are included, as in the OMERO.web viewer and FIJI. So 3–15 projects 13 planes.
+
+| Z_Start | Z_End | Planes projected | Name |
+|---|---|---|---|
+| blank | blank | all (the default) | `{basename}_mip.tif` |
+| 3 | 15 | 3 to 15 | `{basename}_mip3-15.tif` |
+| 5 | blank | 5 to each image's last plane | `{basename}_mip5-30.tif` for a 30-plane image |
+| blank | 10 | 1 to 10 | `{basename}_mip1-10.tif` |
+| 7 | 7 | plane 7 only (a copy of it) | `{basename}_mip7-7.tif` |
+
+The name always shows the planes used for that image. Images with different depths can therefore get different names in one run, as in the third row.
+
+In a batch the same range applies to every image:
+- **A range that does not fit any one image stops the whole run.** Nothing is written, and the message lists every image that does not fit. For example, `Z_End` 15 stops the run if one image has only 10 planes. Use `Dry_Run` to find these images first. Then narrow the range, leave `Z_End` blank to end at each image's last plane, or leave those images out with `Name_Filter` or your selection.
+- **Single-Z images are still skipped**, not rejected. So a dataset that already holds earlier `_mip` results can be processed again.
+- **`Z_Start` after `Z_End`** (for example 15 and 3) is an error, and nothing is written.
 
 ## Outputs
 
@@ -39,14 +59,20 @@ Why these types:
 - **Float sums and averages** are calculated in float64, then stored as float32.
 - **Range check:** a result that does not fit its output type fails that image, and the message says so. A NaN or infinite value in a float input does the same.
 
-Examples: `image_001.ome.tif` becomes `image_001_mip.tif`, `sample.tiff` becomes `sample_sum.tif`, and `sample.vsi` becomes `sample_avg.tif`.
+Examples: `image_001.ome.tif` becomes `image_001_mip.tif`, `sample.tiff` becomes `sample_sum.tif`, and `sample.vsi` becomes `sample_avg.tif`. With a Z range of 3–15, `image_001.ome.tif` becomes `image_001_mip3-15.tif`.
 
 About the names:
 - `.tif` is only part of the OMERO image name. No TIFF file is created; export through OMERO as usual.
 - A repeated run creates new images even when the names match. Use image IDs to tell them apart.
 
 Each output also gets:
-- **A description and a key-value annotation** (namespace `org.jeffleelab.omero.zproject`). It records the source image ID and name, the projection, the number of Z-planes, the source and output pixel types, the script version and the time.
+- **A description and a key-value annotation** (namespace `org.jeffleelab.omero.zproject`). It records:
+  - the source image ID and name;
+  - the projection;
+  - the Z-planes used (`z_start` and `z_end`, numbered from 1, and `z_planes`, how many there were);
+  - the source's Z size (`source_size_z`);
+  - the source and output pixel types;
+  - the script version and the time.
 - **Copied metadata.** OMERO's `copyAndResizeImage` copies the source's X/Y/T sizes (Z = 1), physical pixel sizes and channel metadata. For Sum and Average, the script then changes the new image's pixel type before writing pixels. OMERO's own projection service does the same. The live check confirms both steps. Per-plane timing and positions, ROIs, tags, attachments and rendering settings are not copied.
 
 The script does not use OMERO's built-in projection service. That service clamps sums to the source type's maximum, which loses data. It also leaves out the last Z-plane for sum and average.
@@ -54,7 +80,7 @@ The script does not use OMERO's built-in projection service. That service clamps
 ## Installing (OMERO admin)
 
 1. In OMERO.web, open **Scripts → Upload Script** and upload this script into the same folder as the others, such as `/jefflee_lab`. [Installing a script](../README.md#installing-a-script) has the details and the other ways to install.
-2. Open **Z_Projection** from the Scripts menu and check that it shows the 7 fields.
+2. Open **Z_Projection** from the Scripts menu and check that it shows the 9 fields.
 
 To install a new version, upload the new file with the same name into the same folder. OMERO.web offers **Replace script**, and the script keeps its ID.
 
@@ -63,12 +89,14 @@ To install a new version, upload the new file with the same name into the same f
 Do this once after installing. Use a small multichannel uint16 z-stack and a test dataset.
 
 1. **Dry run:** the output names, pixel types and destination are as expected.
-2. **Runs:** run once with each projection.
+   - With `Z_End` larger than the stack, the dry run lists the image as not fitting, and nothing is written.
+   - Enter 0 in `Z_Start` and note whether OMERO.web stops you (the field minimum is 1). Otherwise the script rejects it, and nothing is written.
+2. **Runs:** run once with each projection. Then run once with a Z range, for example `Z_Start` 2 and `Z_End` 3.
 3. **In OMERO.web**, check that each output:
    - is in the chosen dataset, with the correct name;
    - has pixel type uint16 (max), uint32 (sum) or float (average);
    - has Z = 1 and the source's X/Y/C/T sizes, channel names and physical sizes;
-   - has the key-value annotation.
+   - has the key-value annotation, with `z_start`, `z_end` and `z_planes` matching the name (the whole stack when no range was given).
 
    The uint32 and float images must also render in the viewer. This confirms that changing the pixel type works.
 4. **Pixels:** compare the outputs with a recalculation on your Mac. Run this in the `omero` conda env, from this folder:
@@ -84,16 +112,17 @@ conn = BlitzGateway(input("User: "), getpass.getpass(), host="OMERO_HOST", port=
 conn.connect()
 src, out = conn.getObject("Image", SOURCE_ID), conn.getObject("Image", OUTPUT_ID)
 method = "Sum intensity"  # the Projection used for this output, exactly as shown in the dialog
+z_range = None  # None for the whole stack, or e.g. (2, 3) for an output named ..._sum2-3.tif
 out_type = zp.output_pixel_type(zp.pixel_type(src), method)
 ps, po = src.getPrimaryPixels(), out.getPrimaryPixels()
 diffs = [np.abs(plane.astype(float) - po.getPlane(z, c, t))
-         for z, c, t, plane in zp.output_planes(ps.getPlane, src.getSizeZ(), src.getSizeC(),
-                                                src.getSizeT(), method, out_type)]
+         for z, c, t, plane in zp.output_planes(ps.getPlane, zp.z_indices(z_range, src.getSizeZ()),
+                                                src.getSizeC(), src.getSizeT(), method, out_type)]
 print("max difference:", max(d.max() for d in diffs))
 conn.close()
 ```
 
-   The difference must be 0 for every projection.
+   The difference must be 0 for every projection, including the Z-range output.
 
 5. **In FIJI:** open one uint32 and one float output through the OMERO plugin or an OMERO export.
 6. **As a normal user:** repeat one small run as a non-admin user in a normal group.
