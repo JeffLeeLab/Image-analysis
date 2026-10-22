@@ -97,6 +97,20 @@ class Naming(unittest.TestCase):
                                       ("noext", [5], "noext_bgs-5.tif")]:
             self.assertEqual(script.output_name(name, radii), expected)
 
+    def test_only_known_extensions_removed(self):
+        lif = "20261012_SINV_MOI5_24hpi_cellmask_IFI27_IFNb_MX1_DAPI_63X.lif_-_P_10"
+        for name, expected in [(lif + ".tif", lif + "_bgs-5.tif"), (lif, lif + "_bgs-5.tif"),
+                               ("Experiment.lif [Position 10]", "Experiment.lif [Position 10]_bgs-5.tif"),
+                               ("cells_0.5uM", "cells_0.5uM_bgs-5.tif"), ("cells_0.5uM.czi", "cells_0.5uM_bgs-5.tif"),
+                               ("IMG.TIF", "IMG_bgs-5.tif"), ("sample.OME.TIFF", "sample_bgs-5.tif"),
+                               ("stain.MX1", "stain.MX1_bgs-5.tif")]:
+            self.assertEqual(script.output_name(name, [5]), expected)
+
+    def test_series_names_stay_distinct(self):
+        names = ([f"Experiment.lif_-_P_{n}" for n in range(10, 19)]
+                 + [f"Experiment.lif [Position {n}]" for n in range(10, 19)])
+        self.assertEqual(len({script.output_name(name, [5]) for name in names}), len(names))
+
     def test_projection_marks_step_order(self):
         for projection, expected in [(script.PROJECTION_OFF, "image_001_bgs-0-50.tif"),
                                      (script.MIP_FIRST, "image_001_mip_bgs-0-50.tif"),

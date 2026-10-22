@@ -62,6 +62,7 @@ Why these types:
 Examples: `image_001.ome.tif` becomes `image_001_mip.tif`, `sample.tiff` becomes `sample_sum.tif`, and `sample.vsi` becomes `sample_avg.tif`. With a Z range of 3–15, `image_001.ome.tif` becomes `image_001_mip3-15.tif`.
 
 About the names:
+- **Only a known image extension is removed** to make `{basename}`: `.tif`, `.tiff`, `.ome.tif`, `.lif`, `.czi`, `.vsi`, `.nd2` and other common microscopy formats, in any case. Everything else is kept, including dots inside the name. So `..._63X.lif_-_P_10.tif` becomes `..._63X.lif_-_P_10_mip.tif`, and `cells_0.5uM` becomes `cells_0.5uM_mip.tif`. OMERO's names for series from multi-series files also stay distinct: `Experiment.lif [Position 10]` becomes `Experiment.lif [Position 10]_mip.tif`. The full list is `IMAGE_EXTENSIONS` in the script.
 - `.tif` is only part of the OMERO image name. No TIFF file is created; export through OMERO as usual.
 - A repeated run creates new images even when the names match. Use image IDs to tell them apart.
 

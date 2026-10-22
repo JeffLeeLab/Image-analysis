@@ -19,6 +19,12 @@ from omero.rtypes import rint, rlong, robject, rstring
 
 VERSION = "0.2.0"
 MAX_NAME_LENGTH = 255
+# Only these endings are removed to get the basename; anything else after a dot stays in the name.
+# Compound extensions come first, so .ome.tif is removed whole.
+IMAGE_EXTENSIONS = (".ome.tiff", ".ome.tif", ".ome.btf", ".ome.zarr", ".tiff", ".tif", ".btf",
+                    ".lif", ".czi", ".nd2", ".vsi", ".lsm", ".oib", ".oif", ".oir", ".ims", ".zvi",
+                    ".dv", ".r3d", ".ics", ".ids", ".lei", ".stk", ".nd", ".svs", ".ndpi", ".scn",
+                    ".mrxs", ".dcm", ".mrc", ".zarr", ".h5", ".png", ".jpg", ".jpeg", ".bmp", ".gif")
 MAX_MESSAGE_LINES = 50
 NAMESPACE = "org.jeffleelab.omero.zproject"
 SUPPORTED_TYPES = ("uint8", "uint16", "float")
@@ -67,16 +73,16 @@ def z_indices(z_range, size_z):
 
 
 def output_name(name, method, z_range=None):
-    """Output name: {basename}_mip.tif, _sum.tif or _avg.tif, plus the Z range if given (_mip3-15.tif)."""
+    """Output name: {basename}_mip.tif, _sum.tif or _avg.tif, plus the Z range if given (_mip3-15.tif).
+
+    The basename drops only a known image extension, so 'cells_0.5uM' and OMERO series names such as
+    'Experiment.lif [Position 10]' are kept whole.
+    """
     base = name
-    for suffix in (".ome.tiff", ".ome.tif", ".tiff", ".tif"):
-        if name.lower().endswith(suffix):
-            base = name[:-len(suffix)]
+    for extension in IMAGE_EXTENSIONS:
+        if name.lower().endswith(extension):
+            base = name[:-len(extension)]
             break
-    else:
-        dot = name.rfind(".")
-        if 0 < dot < len(name) - 1:
-            base = name[:dot]
     if not base:
         raise ValueError(f"Image name '{name}' has an empty basename")
     span = "" if z_range is None else f"{z_range[0]}-{z_range[1]}"

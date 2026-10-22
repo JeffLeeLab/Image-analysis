@@ -77,6 +77,20 @@ class Naming(unittest.TestCase):
                                ("field.001.tif", "field.001_mip.tif"), ("noext", "noext_mip.tif")]:
             self.assertEqual(script.output_name(name, MAX), expected)
 
+    def test_only_known_extensions_removed(self):
+        lif = "20261012_SINV_MOI5_24hpi_cellmask_IFI27_IFNb_MX1_DAPI_63X.lif_-_P_10"
+        for name, expected in [(lif + ".tif", lif + "_mip.tif"), (lif, lif + "_mip.tif"),
+                               ("Experiment.lif [Position 10]", "Experiment.lif [Position 10]_mip.tif"),
+                               ("cells_0.5uM", "cells_0.5uM_mip.tif"), ("cells_0.5uM.czi", "cells_0.5uM_mip.tif"),
+                               ("IMG.TIF", "IMG_mip.tif"), ("sample.OME.TIFF", "sample_mip.tif"),
+                               ("stain.MX1", "stain.MX1_mip.tif")]:
+            self.assertEqual(script.output_name(name, MAX), expected)
+
+    def test_series_names_stay_distinct(self):
+        names = ([f"Experiment.lif_-_P_{n}" for n in range(10, 19)]
+                 + [f"Experiment.lif [Position {n}]" for n in range(10, 19)])
+        self.assertEqual(len({script.output_name(name, MAX) for name in names}), len(names))
+
     def test_z_range_in_name(self):
         self.assertEqual(script.output_name("image_001.ome.tif", MAX, (3, 15)), "image_001_mip3-15.tif")
         self.assertEqual(script.output_name("sample.tiff", SUM, (7, 7)), "sample_sum7-7.tif")

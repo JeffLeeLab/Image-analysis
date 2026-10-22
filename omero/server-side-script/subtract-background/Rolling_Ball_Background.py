@@ -25,9 +25,15 @@ try:
 except ImportError:  # reported when the script runs, so it still lists in OMERO.web
     ndi = None
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 MAX_CHANNELS = 8
 MAX_NAME_LENGTH = 255
+# Only these endings are removed to get the basename; anything else after a dot stays in the name.
+# Compound extensions come first, so .ome.tif is removed whole.
+IMAGE_EXTENSIONS = (".ome.tiff", ".ome.tif", ".ome.btf", ".ome.zarr", ".tiff", ".tif", ".btf",
+                    ".lif", ".czi", ".nd2", ".vsi", ".lsm", ".oib", ".oif", ".oir", ".ims", ".zvi",
+                    ".dv", ".r3d", ".ics", ".ids", ".lei", ".stk", ".nd", ".svs", ".ndpi", ".scn",
+                    ".mrxs", ".dcm", ".mrc", ".zarr", ".h5", ".png", ".jpg", ".jpeg", ".bmp", ".gif")
 MAX_MESSAGE_LINES = 50
 NAMESPACE = "org.jeffleelab.omero.bgsub"
 ALGORITHM_COMMIT = "e6360e0a7e04580ac30e143281edae66660f9ec6"
@@ -247,16 +253,16 @@ def radius_token(value):
 
 
 def output_name(name, radii, projection=PROJECTION_OFF):
-    """Fixed output name: {basename}_bgs-{r0}-{r1}-....tif, with _mip placed in step order."""
+    """Fixed output name: {basename}_bgs-{r0}-{r1}-....tif, with _mip placed in step order.
+
+    The basename drops only a known image extension, so 'cells_0.5uM' and OMERO series names such as
+    'Experiment.lif [Position 10]' are kept whole.
+    """
     base = name
-    for suffix in (".ome.tiff", ".ome.tif", ".tiff", ".tif"):
-        if name.lower().endswith(suffix):
-            base = name[:-len(suffix)]
+    for extension in IMAGE_EXTENSIONS:
+        if name.lower().endswith(extension):
+            base = name[:-len(extension)]
             break
-    else:
-        dot = name.rfind(".")
-        if 0 < dot < len(name) - 1:
-            base = name[:dot]
     if not base:
         raise ValueError(f"Image name '{name}' has an empty basename")
     bgs = "_bgs-" + "-".join(radius_token(r) for r in radii)
