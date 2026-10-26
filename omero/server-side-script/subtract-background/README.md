@@ -1,6 +1,6 @@
 # Rolling-ball background subtraction (OMERO script)
 
-[Rolling_Ball_Background.py](Rolling_Ball_Background.py) is a single-file OMERO script. It applies the lab's pinned ImageJ rolling-ball port to raw image planes, with one radius per channel. It writes the results as new images into one dataset and never changes the originals. The contract is in [spec.md](spec.md).
+[Rolling_Ball_Background.py](Rolling_Ball_Background.py) is a single-file OMERO script. It applies the lab's ImageJ rolling-ball port ([misc/python-rolling-ball](https://github.com/JeffLeeLab/Image-analysis/tree/main/misc/python-rolling-ball)) to raw image planes, with one radius per channel. It writes the results as new images into one dataset and never changes the originals. The contract is in [spec.md](spec.md).
 
 **Status:** the local checks (`test_local.py`) pass with the server's versions of Python (3.11), NumPy (2.4.6) and SciPy (1.17.1). The script has **not yet been run on the OMERO server**; see [Live check](#live-check).
 
@@ -52,7 +52,7 @@ About the names:
 - A repeated run creates new images even when the names match. Use image IDs to tell them apart.
 
 Each output also gets:
-- **A description and a key-value annotation** (namespace `org.jeffleelab.omero.bgsub`). It records the source image ID and name, the radius for each channel, the Z projection, the settings, the algorithm commit and hash, the script version and the time.
+- **A description and a key-value annotation** (namespace `org.jeffleelab.omero.bgsub`). It records the source image ID and name, the radius for each channel, the Z projection, the settings, the algorithm source, the script version and the time.
 - **Copied metadata.** OMERO's `copyAndResizeImage` copies the source's dimensions (with Z = 1 for a projection), pixel type, physical pixel sizes and channel metadata; the live check confirms which fields carry over. Per-plane timing and positions, ROIs, tags, attachments and rendering settings are not copied.
 
 Fixed settings:
@@ -116,9 +116,13 @@ python -m unittest test_local -v
 
 ## Algorithm provenance
 
-- **Source:** the block between `BEGIN`/`END pinned imagej_rolling_ball.py` in the script is lines 21–206 of [imagej_rolling_ball.py](https://github.com/JeffLeeLab/Image-analysis/blob/e6360e0a7e04580ac30e143281edae66660f9ec6/people/AlfredoCastello/Zhiling-Marko-HIV/src/imagej_rolling_ball.py), copied verbatim. That is commit `e6360e0`, file SHA-256 `0713d5360395a9cf8748829b2f782d316fa3be57df1bc0827adff8a90af55c9c`.
-- **Check:** `test_local.py` confirms the block still matches the pinned file.
-- **Origin and validation:** the code comes from `rdi/background.py` in the owner's RDI-calculator project (commit `d30fae7`). It is a port of ImageJ's `BackgroundSubtracter.java`. Scientific validation was done there and is accepted, not repeated.
-- **Licence:** no licence was found for the owner's source. Confirm redistribution rights before sharing it outside the institution.
+- **Original:** [`imagej_rolling_ball.py`](https://github.com/JeffLeeLab/Image-analysis/tree/main/misc/python-rolling-ball) in `misc/python-rolling-ball`, a port of ImageJ's `BackgroundSubtracter.java` that is checked numerically against ImageJ 1.54p. That is the one place to maintain it.
+- **Copy here:** the block between `BEGIN`/`END copied from misc/python-rolling-ball/imagej_rolling_ball.py` in the script holds the functions the script uses, copied unchanged. OMERO server-side scripts must be a single file, so they are kept inline. Fix the original and copy the functions again; do not edit them in the script.
+- **Check:** `test_local.py` confirms each copied function still matches the original, and that the background matches ImageJ's own output stored in `misc/python-rolling-ball/tests/imagej_reference.npz` (skipped if that folder is missing).
+- **Licence:** confirm redistribution rights before sharing the code outside the institution.
+
+## Changelog
+
+- **0.4.2 (2026-10-26):** ImageJ-parity fixes, taken from the original. (1) The rolling-ball patch width rounds halves up as Java does; before, radii such as 11, 15, 17, 21, 27, 34, 38, 46, 50, 58, 70, 82, 94, 108, 132, 140, 156, 164, 188, 212, 220, 236, 244, 268, 292 and 300 (and non-integers such as 7.5) used a patch 2 px too narrow, which gave backgrounds off by up to about 7% of the image range. Radii such as 10 and 100 were not affected. (2) Shrinking is skipped only when the shrunken image would be under 2 px (ceiling, not floor), as in ImageJ. (3) The 3x3 presmooth runs along x, then y. The algorithm source now points at `misc/python-rolling-ball`. The annotation key `algorithm_source` replaces `algorithm_commit` and `algorithm_sha256`.
 
 The earlier multi-package version (v0.1.0, with a separate uv worker, external adapter and journal/resume) is kept in git commit `84108b4`.

@@ -1,10 +1,10 @@
 # OMERO rolling-ball background subtraction: specification v0.4
 
-Revised 15 October 2026. v0.4 allows up to 8 channels and turns the dry run off by default. v0.3 added the optional Z max-intensity projection (§2).
+Revised 26 October 2026: ImageJ-parity fixes, and the algorithm now comes from `misc/python-rolling-ball`. v0.4 allows up to 8 channels and turns the dry run off by default. v0.3 added the optional Z max-intensity projection (§2).
 
 This revision replaces the v0.1 specification, which called for an uploaded entry script, an external adapter package, a separate uv worker environment and journal-based resume. That design and its implementation are kept in git commit `84108b4`.
 
-Scientific validation was done in the owner's RDI-calculator project. It is accepted for the unchanged pinned algorithm and is not repeated here.
+The algorithm is maintained in `misc/python-rolling-ball/imagej_rolling_ball.py`, which is checked numerically against ImageJ 1.54p. The script embeds a copy of the functions it uses and does not repeat that validation.
 
 ## 1. Contract
 
@@ -15,7 +15,7 @@ Scientific validation was done in the owner's RDI-calculator project. It is acce
 | Input | Image IDs, or exactly one dataset ID. An optional wildcard filters by full image name. |
 | Channels | Up to 8. One radius field per channel, in stored channel order. Every channel needs a value; 0 means copy unchanged. |
 | Batch | Same channel count and same ordered (trimmed) channel names across all images. X/Y/Z/T may vary. |
-| Algorithm | The pinned port, unchanged. Presmooth on, automatic shrink, dark background, corrected negatives clipped to 0. |
+| Algorithm | The `misc/python-rolling-ball` port, copied unchanged. Presmooth on, automatic shrink, dark background, corrected negatives clipped to 0. |
 | Z projection | Optional, off by default: a max-intensity projection along Z, either before or after subtraction. The output then has one Z-plane. |
 | Pixel types | uint8, uint16, float32. Each output keeps its source's type. |
 | Destination | Exactly one: an existing dataset ID, or a new dataset name. |
@@ -90,7 +90,7 @@ Radii are written in their shortest decimal form: `50.0 → 50`, `12.50 → 12.5
 2. sets the name and description;
 3. uploads planes with `RawPixelsStore.setPlane(z, c, t)`;
 4. sets each channel's min/max;
-5. adds the key-value annotation (namespace `org.jeffleelab.omero.bgsub`), which records the source ID and name, radius per channel, Z projection, settings, algorithm commit and SHA-256, script version and UTC time;
+5. adds the key-value annotation (namespace `org.jeffleelab.omero.bgsub`), which records the source ID and name, radius per channel, Z projection, settings, algorithm source, script version and UTC time;
 6. **last**, links the image to the destination dataset.
 
 If any step fails, the script deletes that new image and its annotation. Not copied: per-plane timing and positions, ROIs, tags, attachments, rendering settings.
@@ -105,11 +105,12 @@ If any step fails, the script deletes that new image and its annotation. Not cop
 ## 6. Verification
 
 - **Local:** `test_local.py` covers:
-  - the pinned block, byte for byte;
+  - each embedded function against the original in `misc/python-rolling-ball`;
+  - the background against ImageJ's own output (fixture in `misc/python-rolling-ball/tests`);
   - naming;
   - copying, rounding and NaN rejection;
   - both Z projection orders, with radius 0 and with NaN slices;
-  - agreement with the pinned module;
+  - agreement with the original module;
   - the dialog declaration;
   - preflight and dry-run messages, using fake OMERO objects.
 - **Live:** the checklist in [README.md](README.md#live-check) covers the SciPy environment, a dry run, exact copying when every radius is 0, a projected run, agreement of positive-radius pixels with a local recalculation, metadata and links, and a run as a non-admin user.

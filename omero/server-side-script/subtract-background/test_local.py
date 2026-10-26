@@ -4,8 +4,9 @@ Run from this folder in the `omero` conda env (needs SciPy):
     python -m unittest test_local -v
 Image creation and upload are covered by the live check in README.md.
 """
-import hashlib
+import ast
 import importlib.util
+import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -15,10 +16,11 @@ from unittest.mock import patch
 import numpy as np
 from omero.rtypes import unwrap
 
-sys.dont_write_bytecode = True  # keep __pycache__ out of the pinned algorithm's folder
+sys.dont_write_bytecode = True  # keep __pycache__ out of misc/python-rolling-ball
 HERE = Path(__file__).resolve().parent
 SCRIPT = HERE / "Rolling_Ball_Background.py"
-PINNED = HERE.parents[2] / "people/AlfredoCastello/Zhiling-Marko-HIV/src/imagej_rolling_ball.py"
+REFERENCE = HERE / "../../../misc/python-rolling-ball/imagej_rolling_ball.py"
+IMAGEJ_REFERENCE = HERE / "../../../misc/python-rolling-ball/tests/imagej_reference.npz"
 
 
 def load(path, name):
@@ -29,7 +31,11 @@ def load(path, name):
 
 
 script = load(SCRIPT, "bgsub_script")
-pinned = load(PINNED, "pinned_rolling_ball")
+
+
+reference = load(REFERENCE, "reference_rolling_ball") if REFERENCE.exists() else None
+COPIED = ("rolling_ball_background", "imagej_shrink_factor", "rolling_ball_patch", "_ball_table_row",
+          "_rolling_ball_2d", "_presmooth_3x3", "_shrink_min", "_roll_ball", "_interp_arrays", "_enlarge")
 
 
 class FakeImage:
@@ -77,15 +83,58 @@ class FakeConn:
         return self.objects.get((kind, object_id))
 
 
-class AlgorithmIsPinned(unittest.TestCase):
-    def test_pinned_file_hash(self):
-        self.assertEqual(hashlib.sha256(PINNED.read_bytes()).hexdigest(), script.ALGORITHM_SHA256)
+@unittest.skipIf(reference is None, "misc/python-rolling-ball not found")
+class AlgorithmIsCopied(unittest.TestCase):
+    """The embedded functions must stay a straight copy of misc/python-rolling-ball."""
 
-    def test_block_is_verbatim(self):
-        text = SCRIPT.read_text()
-        block = text.split("# --- BEGIN pinned imagej_rolling_ball.py ---\n")[1]
-        block = block.split("# --- END pinned imagej_rolling_ball.py ---\n")[0]
-        self.assertEqual(block, "".join(PINNED.read_text().splitlines(keepends=True)[20:]))
+    def test_functions_match_the_original(self):
+        original = ast.parse(REFERENCE.read_text())
+        copy = SCRIPT.read_text()
+        original_text = REFERENCE.read_text()
+        for node in original.body:
+            if isinstance(node, ast.FunctionDef) and node.name in COPIED:
+                self.assertIn(ast.get_source_segment(original_text, node), copy, node.name)
+        self.assertEqual(len(COPIED), 10)
+
+    def test_ball_table_matches_the_original(self):
+        self.assertEqual(script._IMAGEJ_BALL_TABLE, reference._IMAGEJ_BALL_TABLE)
+
+
+class ImageJParity(unittest.TestCase):
+    def test_patch_width_rounds_half_up(self):
+        # ImageJ uses Java Math.round; Python's round() would give 17, 13 and 19 here.
+        for radius, width in ((50, 19), (7.5, 15), (25, 21)):
+            patch = script.rolling_ball_patch(radius, script.imagej_shrink_factor(radius))
+            self.assertEqual(patch.shape, (width, width), radius)
+
+    def test_presmooth_filters_x_then_y(self):
+        image = np.random.default_rng(1).normal(size=(9, 11))
+        x_first = script.ndi.uniform_filter1d(image, size=3, axis=1, mode="nearest")
+        expected = script.ndi.uniform_filter1d(x_first, size=3, axis=0, mode="nearest")
+        self.assertTrue(np.array_equal(script._presmooth_3x3(image), expected))
+
+    def test_shrink_guard_uses_the_ceiling(self):
+        # 5 px with factor 4: the shrunken size is ceil(5/4) = 2, so shrinking is kept (floor gave 1).
+        calls = []
+        real = script._shrink_min
+        with patch.object(script, "_shrink_min", side_effect=lambda im, f: calls.append(f) or real(im, f)):
+            script._rolling_ball_2d(np.arange(30.0).reshape(5, 6), 50, presmooth=False, shrink_factor=4)
+            self.assertEqual(calls, [4])
+            calls.clear()
+            script._rolling_ball_2d(np.arange(24.0).reshape(4, 6), 50, presmooth=False, shrink_factor=4)
+            self.assertEqual(calls, [])  # ceil(4/4) = 1 < 2: no shrinking
+
+    @unittest.skipUnless(IMAGEJ_REFERENCE.exists(), "ImageJ reference fixture not found")
+    def test_background_matches_imagej(self):
+        reference = np.load(IMAGEJ_REFERENCE)
+        cases = [c for c in json.loads(str(reference["meta"]))["cases"] if c["create_background"]]
+        self.assertTrue(cases)
+        for case in cases:
+            image = reference[case["input"]]
+            result = script.rolling_ball_background(image, case["radius"], light_background=case["light_background"],
+                                                    presmooth=case["presmooth"])
+            tolerance = 1e-5 * np.ptp(image)
+            self.assertLessEqual(np.abs(result - reference[case["output"]]).max(), tolerance, case)
 
 
 class Naming(unittest.TestCase):
@@ -140,9 +189,11 @@ class CorrectPlane(unittest.TestCase):
             self.assertTrue(np.array_equal(result, plane))
             self.assertIsNot(result, plane)
 
-    def test_positive_radius_matches_pinned_module(self):
+    def test_positive_radius_matches_original(self):
+        if reference is None:
+            self.skipTest("misc/python-rolling-ball not found")
         for plane in self.planes.values():
-            corrected, _ = pinned.subtract_background_image(plane, pinned.rolling_ball_background(plane, 12.5))
+            corrected, _ = script.subtract_background_image(plane, reference.rolling_ball_background(plane, 12.5))
             if plane.dtype.kind == "u":
                 corrected = np.floor(np.clip(corrected, 0, np.iinfo(plane.dtype).max) + 0.5)
             result = script.correct_plane(plane, 12.5)

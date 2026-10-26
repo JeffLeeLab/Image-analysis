@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Rolling-ball background subtraction for OMERO images.
 
-Reads raw planes, applies the lab's pinned ImageJ rolling-ball port with one
+Reads raw planes, applies the lab's ImageJ rolling-ball port (misc/python-rolling-ball) with one
 radius per channel, and writes new images into one explicitly chosen dataset.
 Source images are never modified. Needs SciPy in the OMERO server's Python
 environment (see ../README.md).
@@ -25,7 +25,7 @@ try:
 except ImportError:  # reported when the script runs, so it still lists in OMERO.web
     ndi = None
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 MAX_CHANNELS = 8
 MAX_NAME_LENGTH = 255
 # Only these endings are removed to get the basename; anything else after a dot stays in the name.
@@ -36,8 +36,7 @@ IMAGE_EXTENSIONS = (".ome.tiff", ".ome.tif", ".ome.btf", ".ome.zarr", ".tiff", "
                     ".mrxs", ".dcm", ".mrc", ".zarr", ".h5", ".png", ".jpg", ".jpeg", ".bmp", ".gif")
 MAX_MESSAGE_LINES = 50
 NAMESPACE = "org.jeffleelab.omero.bgsub"
-ALGORITHM_COMMIT = "e6360e0a7e04580ac30e143281edae66660f9ec6"
-ALGORITHM_SHA256 = "0713d5360395a9cf8748829b2f782d316fa3be57df1bc0827adff8a90af55c9c"
+ALGORITHM_SOURCE = "misc/python-rolling-ball/imagej_rolling_ball.py"
 SETTINGS = ("presmooth on; automatic shrink; dark background; "
             "corrected negatives clipped to 0; source pixel type kept")
 SUPPORTED_TYPES = ("uint8", "uint16", "float")
@@ -46,130 +45,19 @@ PROJECTIONS = ("Off", "Max projection, then subtract", "Subtract, then max proje
 PROJECTION_OFF, MIP_FIRST, MIP_LAST = PROJECTIONS
 
 
-# Pinned rolling-ball algorithm, copied verbatim (lines 21-206) from
-# https://github.com/JeffLeeLab/Image-analysis/blob/e6360e0a7e04580ac30e143281edae66660f9ec6/people/AlfredoCastello/Zhiling-Marko-HIV/src/imagej_rolling_ball.py
-# (file SHA-256 ALGORITHM_SHA256). It ports ImageJ's BackgroundSubtracter.java and
-# comes from the owner's RDI-calculator project (rdi/background.py, commit d30fae7),
-# where it was validated. Do not edit: test_local.py checks it against the pinned file.
-# --- BEGIN pinned imagej_rolling_ball.py ---
-_IMAGEJ_SHRINK_TABLE = (
+# Rolling-ball algorithm: the functions from here to the end marker are copied from
+# https://github.com/JeffLeeLab/Image-analysis/tree/main/misc/python-rolling-ball (imagej_rolling_ball.py),
+# a port of ImageJ's BackgroundSubtracter.java checked against ImageJ. They are kept inline because
+# OMERO server-side scripts must be a single file. Fix them in the original and copy them here again;
+# do not edit them here. test_local.py checks that each one matches the original.
+# --- BEGIN copied from misc/python-rolling-ball/imagej_rolling_ball.py ---
+# ImageJ's RollingBall constructor: (largest radius, shrink factor, arc-trim percent)
+_IMAGEJ_BALL_TABLE = (
     (10, 1, 24),
     (30, 2, 24),
     (100, 4, 32),
     (np.inf, 8, 40),
 )
-
-
-# --------------------------------------------------------------------------
-# Rolling ball (ImageJ port)
-# --------------------------------------------------------------------------
-
-
-def imagej_shrink_factor(radius: float) -> int:
-    """Shrink factor ImageJ picks for ``radius`` (1, 2, 4 or 8)."""
-    for max_r, shrink, _ in _IMAGEJ_SHRINK_TABLE:
-        if radius <= max_r:
-            return shrink
-    raise AssertionError("unreachable")
-
-
-def _arc_trim_percent(radius: float) -> int:
-    for max_r, _, trim in _IMAGEJ_SHRINK_TABLE:
-        if radius <= max_r:
-            return trim
-    raise AssertionError("unreachable")
-
-
-def rolling_ball_patch(radius: float, shrink_factor: int) -> np.ndarray:
-    """ImageJ's ``RollingBall.buildRollingBall``: a square patch from the top of a sphere.
-
-    Heights ``sqrt(r_small^2 - x^2 - y^2)`` on a ``(2*half_width+1)`` square
-    with ``half_width = round(r_small - trim)``; points outside the sphere get
-    height 0 (ImageJ's choice, kept for parity). ``r_small = radius / shrink_factor``
-    (min 1). Only the arc-trim percentage depends on the *requested* radius,
-    as in ImageJ.
-    """
-    trim_per = _arc_trim_percent(radius)
-    small_r = max(radius / shrink_factor, 1.0)
-    xtrim = int(trim_per * small_r) // 100
-    half_width = int(round(small_r - xtrim))
-    width = 2 * half_width + 1
-    yy, xx = np.mgrid[-half_width : half_width + 1, -half_width : half_width + 1]
-    temp = small_r * small_r - xx * xx - yy * yy
-    patch = np.where(temp > 0, np.sqrt(np.clip(temp, 0, None)), 0.0)
-    assert patch.shape == (width, width)
-    return patch.astype(np.float64)
-
-
-def _presmooth_3x3(image: np.ndarray) -> np.ndarray:
-    """ImageJ ``filter3x3(fp, MEAN)``: separable 3-point mean, edge pixels repeated."""
-    out = ndi.uniform_filter1d(image, size=3, axis=0, mode="nearest")
-    out = ndi.uniform_filter1d(out, size=3, axis=1, mode="nearest")
-    return out
-
-
-def _shrink_min(image: np.ndarray, factor: int) -> np.ndarray:
-    """ImageJ ``shrinkImage``: each small pixel is the min of its ``factor x factor`` block."""
-    h, w = image.shape
-    sh, sw = -(-h // factor), -(-w // factor)
-    padded = np.full((sh * factor, sw * factor), np.inf, dtype=np.float64)
-    padded[:h, :w] = image
-    return padded.reshape(sh, factor, sw, factor).min(axis=(1, 3))
-
-
-def _roll_ball(image: np.ndarray, patch: np.ndarray) -> np.ndarray:
-    """ImageJ ``rollBall``: grayscale opening with the non-flat ``patch``.
-
-    Points outside the image do not take part in either the erosion (pad
-    with +inf) or the dilation (pad with -inf), which is how ImageJ clips the
-    patch at the image border.
-    """
-    pad = patch.shape[0] // 2
-    padded = np.pad(image, pad, mode="constant", constant_values=np.inf)
-    eroded = ndi.grey_erosion(padded, structure=patch, mode="constant", cval=np.inf)
-    dilated = ndi.grey_dilation(eroded, structure=patch, mode="constant", cval=-np.inf)
-    return dilated[pad:-pad, pad:-pad]
-
-
-def _interp_arrays(length: int, small_length: int, factor: int):
-    """ImageJ ``makeInterpolationArrays``: left index and its weight for each full-res pixel."""
-    i = np.arange(length)
-    small_index = (i - factor // 2) // factor
-    small_index = np.minimum(small_index, small_length - 2)
-    small_index = np.maximum(small_index, 0)
-    distance = (i + 0.5) / factor - (small_index + 0.5)
-    weights = 1.0 - distance
-    return small_index, weights
-
-
-def _enlarge(small: np.ndarray, shape: tuple[int, int], factor: int) -> np.ndarray:
-    """ImageJ ``enlargeImage``: bilinear interpolation between small-pixel centres (extrapolates at edges)."""
-    h, w = shape
-    sh, sw = small.shape
-    if sh < 2 or sw < 2:
-        return np.broadcast_to(small[:1, :1], shape).astype(np.float64)
-    yi, wy = _interp_arrays(h, sh, factor)
-    xi, wx = _interp_arrays(w, sw, factor)
-    row0 = small[yi, :]
-    row1 = small[yi + 1, :]
-    lines0 = row0[:, xi] * wx + row0[:, xi + 1] * (1.0 - wx)
-    lines1 = row1[:, xi] * wx + row1[:, xi + 1] * (1.0 - wx)
-    return lines0 * wy[:, None] + lines1 * (1.0 - wy[:, None])
-
-
-def _rolling_ball_2d(plane: np.ndarray, radius: float, *, presmooth: bool, shrink_factor: int) -> np.ndarray:
-    fp = np.asarray(plane, dtype=np.float64)
-    if presmooth:
-        fp = _presmooth_3x3(fp)
-    h, w = fp.shape
-    if shrink_factor > 1 and (h // shrink_factor < 2 or w // shrink_factor < 2):
-        shrink_factor = 1  # too small to shrink meaningfully
-    patch = rolling_ball_patch(radius, shrink_factor)
-    small = _shrink_min(fp, shrink_factor) if shrink_factor > 1 else fp
-    small_bg = _roll_ball(small, patch)
-    if shrink_factor > 1:
-        return _enlarge(small_bg, (h, w), shrink_factor)
-    return small_bg
 
 
 def rolling_ball_background(
@@ -180,65 +68,163 @@ def rolling_ball_background(
     presmooth: bool = True,
     shrink: int | None = None,
 ) -> np.ndarray:
-    """Estimate the background image the way ImageJ's rolling ball does.
+    """Estimate the background the way ImageJ's rolling ball does.
+
+    Equivalent to ImageJ's Subtract Background with "Create background (don't
+    subtract)" ticked, except that the result is always float64.
 
     Parameters
     ----------
-    image : ndarray
-        2D ``(y, x)`` or 3D ``(z, y, x)``; a 3D stack is processed one
-        z-plane at a time (ImageJ processes stacks slice by slice).
+    image : array_like, shape (..., y, x)
+        Any real dtype. Every 2D plane over the last two axes is processed
+        independently, as ImageJ does for stacks and hyperstacks, so the last
+        two axes must be y and x (not channels-last).
     radius : float
-        Ball radius in xy pixels, as in ImageJ. Larger than the largest
-        foreground object you want to keep; ~100–150 px for whole cells at
-        typical magnification.
+        Ball radius in pixels, as in ImageJ's dialog (default there: 50). Use
+        a value at least as large as the radius of the largest object that is
+        not part of the background.
     light_background : bool
-        Dark features on a bright background (ImageJ "Light background"):
-        the image is negated before and after.
+        Bright background with dark objects (ImageJ "Light background"). The
+        image is negated, rolled, and negated back, so the ball runs along the
+        top of the intensity surface.
     presmooth : bool
-        ImageJ's default 3x3 mean before estimating (uncheck "Disable
-        smoothing"). The background is estimated on the smoothed image but
-        subtracted from the raw one, so a few raw pixels can end up below 0
-        and get clipped.
+        Apply ImageJ's 3x3 mean before estimating the background (``False`` =
+        "Disable smoothing" ticked). Smoothing removes noise from the estimate,
+        so the background is no longer guaranteed to lie below every raw pixel.
     shrink : int, optional
-        Override ImageJ's automatic shrink factor (1 for r<=10, 2 for r<=30,
-        4 for r<=100, else 8). ``1`` disables shrinking and is slow for large
-        radii.
+        Override ImageJ's automatic shrink factor (1 for radius <= 10, 2 for
+        <= 30, 4 for <= 100, else 8). ``1`` turns shrinking off; the result is
+        then closer to an ideal rolling ball but much slower for large radii.
 
     Returns
     -------
-    background : float64 ndarray, same shape as ``image``.
+    background : ndarray of float64, same shape as ``image``.
     """
     image = np.asarray(image)
     if radius is None or not np.isfinite(radius) or radius <= 0:
         raise ValueError(f"radius must be a positive number of pixels, got {radius!r}")
-    if image.ndim not in (2, 3):
-        raise ValueError(f"image must be 2D (y, x) or 3D (z, y, x), got ndim={image.ndim}")
+    if image.ndim < 2:
+        raise ValueError(f"image must have at least 2 dimensions (..., y, x), got shape {image.shape}")
     factor = imagej_shrink_factor(radius) if shrink is None else int(shrink)
     if factor < 1:
         raise ValueError(f"shrink must be >= 1, got {shrink!r}")
 
     sign = -1.0 if light_background else 1.0
     work = sign * image.astype(np.float64)
-    if image.ndim == 2:
-        bg = _rolling_ball_2d(work, radius, presmooth=presmooth, shrink_factor=factor)
-    else:
-        bg = np.stack(
-            [_rolling_ball_2d(plane, radius, presmooth=presmooth, shrink_factor=factor) for plane in work],
-            axis=0,
-        )
-    return sign * bg
+    if not np.all(np.isfinite(work)):
+        raise ValueError("image contains NaN or infinite values; replace them before estimating the background")
+    planes = work.reshape(-1, *image.shape[-2:])
+    bg = np.stack([_rolling_ball_2d(p, radius, presmooth=presmooth, shrink_factor=factor) for p in planes])
+    return sign * bg.reshape(image.shape)
+
+
+def imagej_shrink_factor(radius: float) -> int:
+    """Shrink factor ImageJ uses for ``radius``: 1 (<= 10), 2 (<= 30), 4 (<= 100), else 8."""
+    return _ball_table_row(radius)[0]
+
+
+def rolling_ball_patch(radius: float, shrink_factor: int) -> np.ndarray:
+    """The ball as a height map: ImageJ ``RollingBall.buildRollingBall``.
+
+    A square patch from the top of a sphere of radius ``r_small = radius /
+    shrink_factor`` (at least 1), holding ``sqrt(r_small^2 - x^2 - y^2)`` on a
+    ``(2 * half_width + 1)``-wide grid. ``half_width`` is ``r_small`` minus a
+    trim of 24-40% (the percentage depends on the requested ``radius``, as in
+    ImageJ). Grid points outside the sphere get height 0, also as in ImageJ.
+    """
+    trim_per = _ball_table_row(radius)[1]
+    small_r = max(radius / shrink_factor, 1.0)
+    xtrim = int(trim_per * small_r) // 100
+    half_width = int(np.floor(small_r - xtrim + 0.5))  # Java Math.round rounds halves up; Python's round() does not
+    yy, xx = np.mgrid[-half_width : half_width + 1, -half_width : half_width + 1]
+    temp = small_r * small_r - xx * xx - yy * yy
+    return np.where(temp > 0, np.sqrt(np.clip(temp, 0, None)), 0.0)
+
+
+def _ball_table_row(radius: float) -> tuple[int, int]:
+    """(shrink factor, arc-trim percent) from ImageJ's ``RollingBall`` constructor."""
+    for max_r, shrink, trim in _IMAGEJ_BALL_TABLE:
+        if radius <= max_r:
+            return shrink, trim
+    raise AssertionError("unreachable")
+
+
+def _rolling_ball_2d(plane: np.ndarray, radius: float, *, presmooth: bool, shrink_factor: int) -> np.ndarray:
+    """ImageJ ``rollingBallFloatBackground`` for one float64 plane (already negated for a light background)."""
+    if presmooth:
+        plane = _presmooth_3x3(plane)
+    h, w = plane.shape
+    # ImageJ's enlarge step needs a shrunken image at least 2 px each way; below that
+    # it interpolates against a zero line and returns a corrupt background, so skip shrinking.
+    if shrink_factor > 1 and (-(-h // shrink_factor) < 2 or -(-w // shrink_factor) < 2):
+        shrink_factor = 1
+    patch = rolling_ball_patch(radius, shrink_factor)
+    if shrink_factor == 1:
+        return _roll_ball(plane, patch)
+    small_bg = _roll_ball(_shrink_min(plane, shrink_factor), patch)
+    return _enlarge(small_bg, (h, w), shrink_factor)
+
+
+def _presmooth_3x3(image: np.ndarray) -> np.ndarray:
+    """ImageJ ``filter3x3(fp, MEAN)``: 3-point mean along x, then along y; edge pixels repeated."""
+    out = ndi.uniform_filter1d(image, size=3, axis=1, mode="nearest")
+    return ndi.uniform_filter1d(out, size=3, axis=0, mode="nearest")
+
+
+def _shrink_min(image: np.ndarray, factor: int) -> np.ndarray:
+    """ImageJ ``shrinkImage``: each small pixel is the min of its ``factor x factor`` block (ragged at the far edges)."""
+    h, w = image.shape
+    sh, sw = -(-h // factor), -(-w // factor)
+    padded = np.full((sh * factor, sw * factor), np.inf, dtype=np.float64)
+    padded[:h, :w] = image
+    return padded.reshape(sh, factor, sw, factor).min(axis=(1, 3))
+
+
+def _roll_ball(image: np.ndarray, patch: np.ndarray) -> np.ndarray:
+    """ImageJ ``rollBall``: grayscale opening with the non-flat ``patch``.
+
+    The ball centre also visits positions up to the patch half-width outside
+    the image, and only points inside the image constrain or receive the ball,
+    which is how ImageJ clips the patch at the border. Padding with +inf
+    for the erosion and -inf for the dilation does the same.
+    """
+    pad = patch.shape[0] // 2
+    padded = np.pad(image, pad, mode="constant", constant_values=np.inf)
+    eroded = ndi.grey_erosion(padded, structure=patch, mode="constant", cval=np.inf)
+    dilated = ndi.grey_dilation(eroded, structure=patch, mode="constant", cval=-np.inf)
+    return dilated[pad:-pad, pad:-pad]
+
+
+def _interp_arrays(length: int, small_length: int, factor: int) -> tuple[np.ndarray, np.ndarray]:
+    """ImageJ ``makeInterpolationArrays``: lower small-image index and its weight for each full-size pixel."""
+    i = np.arange(length)
+    small_index = (i - factor // 2) // factor
+    small_index = np.clip(small_index, 0, small_length - 2)  # Java's truncating division gives 0 at the low edge
+    distance = (i + 0.5) / factor - (small_index + 0.5)
+    return small_index, 1.0 - distance
+
+
+def _enlarge(small: np.ndarray, shape: tuple[int, int], factor: int) -> np.ndarray:
+    """ImageJ ``enlargeImage``: bilinear interpolation between small-pixel centres, extrapolating at the edges."""
+    h, w = shape
+    sh, sw = small.shape
+    yi, wy = _interp_arrays(h, sh, factor)
+    xi, wx = _interp_arrays(w, sw, factor)
+    row0 = small[yi, :]
+    row1 = small[yi + 1, :]
+    lines0 = row0[:, xi] * wx + row0[:, xi + 1] * (1.0 - wx)
+    lines1 = row1[:, xi] * wx + row1[:, xi + 1] * (1.0 - wx)
+    return lines0 * wy[:, None] + lines1 * (1.0 - wy[:, None])
+# --- END copied from misc/python-rolling-ball/imagej_rolling_ball.py ---
 
 
 def subtract_background_image(image: np.ndarray, background) -> tuple[np.ndarray, float]:
-    """``image - background``, negatives clipped to 0 (spec.md §8.2). Returns (float64 image, frac_clipped)."""
+    """``image - background``, negatives clipped to 0 (spec.md). Returns (float64 image, frac_clipped)."""
     corrected = np.asarray(image, dtype=np.float64) - background
     if corrected.size == 0:
         return corrected, float("nan")
     frac_clipped = float(np.mean(corrected < 0))
     return np.clip(corrected, 0, None), frac_clipped
-
-
-# --- END pinned imagej_rolling_ball.py ---
 
 
 def radius_token(value):
@@ -415,8 +401,7 @@ def add_provenance(conn, new_image, source, mapping, projection):
         ["radii_by_channel", mapping],
         ["z_projection", projection],
         ["settings", SETTINGS],
-        ["algorithm_commit", ALGORITHM_COMMIT],
-        ["algorithm_sha256", ALGORITHM_SHA256],
+        ["algorithm_source", ALGORITHM_SOURCE],
         ["script_version", VERSION],
         ["created_utc", datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")],
     ])
