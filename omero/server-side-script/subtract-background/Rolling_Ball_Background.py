@@ -8,10 +8,12 @@ environment (see ../README.md).
 """
 from __future__ import annotations
 
+import contextlib
 import datetime
 import fnmatch
 import functools
 import math
+import time
 from decimal import Decimal
 
 import numpy as np
@@ -25,7 +27,7 @@ try:
 except ImportError:  # reported when the script runs, so it still lists in OMERO.web
     ndi = None
 
-VERSION = "0.4.2"
+VERSION = "0.5.0"
 MAX_CHANNELS = 8
 MAX_NAME_LENGTH = 255
 # Only these endings are removed to get the basename; anything else after a dot stays in the name.
@@ -40,6 +42,8 @@ ALGORITHM_SOURCE = "misc/python-rolling-ball/imagej_rolling_ball.py"
 SETTINGS = ("presmooth on; automatic shrink; dark background; "
             "corrected negatives clipped to 0; source pixel type kept")
 SUPPORTED_TYPES = ("uint8", "uint16", "float")
+# OMERO's "float" is 32-bit.
+READ_TYPES = {"uint8": np.uint8, "uint16": np.uint16, "float": np.float32}
 RADIUS_HELP = "Radius in XY pixels. 0 = skip subtraction and keep this channel unchanged."
 PROJECTIONS = ("Off", "Max projection, then subtract", "Subtract, then max projection")
 PROJECTION_OFF, MIP_FIRST, MIP_LAST = PROJECTIONS
@@ -304,6 +308,41 @@ def channel_names(image):
     return [(ch.getLogicalChannel().name or "").strip() for ch in image.getChannels(noRE=True)]
 
 
+def pixel_type(image):
+    return image.getPrimaryPixels().getPixelsType().getValue()
+
+
+@contextlib.contextmanager
+def plane_reader(conn, image, timing):
+    """Yield get_plane(z, c, t) for image, reading every plane through one open RawPixelsStore.
+
+    omero-py's PixelsWrapper.getPlane() opens a new store (and so the original file, through
+    Bio-Formats) for every plane, and decodes with struct.unpack. This opens the file once per
+    image and decodes with np.frombuffer. Returns native-byte-order, writable 2D arrays (y, x).
+    Seconds spent reading are added to timing["read"] if timing is given.
+    """
+    size_x, size_y = image.getSizeX(), image.getSizeY()
+    wire = np.dtype(READ_TYPES[pixel_type(image)]).newbyteorder(">")  # OMERO sends big-endian
+    expected = size_x * size_y * wire.itemsize
+    store = conn.c.sf.createRawPixelsStore()
+    try:
+        store.setPixelsId(image.getPixelsId(), True, conn.SERVICE_OPTS)
+
+        def get_plane(z, c, t):
+            start = time.perf_counter()
+            raw = store.getPlane(z, c, t, conn.SERVICE_OPTS)
+            if len(raw) != expected:
+                raise ValueError(f"Plane z={z} c={c} t={t}: got {len(raw)} bytes, expected {expected}")
+            plane = np.frombuffer(raw, dtype=wire).reshape(size_y, size_x).astype(wire.newbyteorder("="))
+            if timing is not None:
+                timing["read"] += time.perf_counter() - start
+            return plane
+
+        yield get_plane
+    finally:
+        store.close(conn.SERVICE_OPTS)
+
+
 def needs_pyramid(image):
     store = image.getPrimaryPixels()._prepareRawPixelsStore()
     try:
@@ -341,9 +380,9 @@ def plan_batch(images, params):
     reference = channel_names(images[0])
     for image in images:
         label = f"Image {image.getId()} '{image.getName()}'"
-        pixel_type = image.getPrimaryPixels().getPixelsType().getValue()
-        if pixel_type not in SUPPORTED_TYPES:
-            errors.append(f"{label}: pixel type {pixel_type} is not supported (uint8, uint16, float)")
+        source_type = pixel_type(image)
+        if source_type not in SUPPORTED_TYPES:
+            errors.append(f"{label}: pixel type {source_type} is not supported (uint8, uint16, float)")
         names = channel_names(image)
         if len(names) > MAX_CHANNELS:
             errors.append(f"{label}: {len(names)} channels, but the form has {MAX_CHANNELS} radius fields")
@@ -409,8 +448,11 @@ def add_provenance(conn, new_image, source, mapping, projection):
     new_image.linkAnnotation(annotation)
 
 
-def process_image(conn, image, radii, name, dataset, mapping, projection):
-    """Write one background-subtracted copy of image into dataset."""
+def process_image(conn, image, radii, name, dataset, mapping, projection, timing):
+    """Write one background-subtracted copy of image into dataset.
+
+    Seconds spent reading and writing pixels are added to timing["read"] and timing["write"].
+    """
     pixels_service = conn.getPixelsService()
     update = conn.getUpdateService()
     size_z, size_c, size_t = image.getSizeZ(), image.getSizeC(), image.getSizeT()
@@ -426,19 +468,21 @@ def process_image(conn, image, radii, name, dataset, mapping, projection):
             f"Rolling-ball background subtraction of image {image.getId()} ({image.getName()}). "
             f"Radii by channel: {mapping}. Z projection: {projection}. {SETTINGS}."))
         update.saveObject(new_image._obj, conn.SERVICE_OPTS)
-        source_pixels = image.getPrimaryPixels()
         ranges = [[math.inf, -math.inf] for _ in range(size_c)]
-        store = conn.c.sf.createRawPixelsStore()
-        try:
-            store.setPixelsId(new_image.getPixelsId(), True, conn.SERVICE_OPTS)
-            for z, c, t, result in output_planes(source_pixels.getPlane, size_z, size_c, size_t,
-                                                 radii, projection):
-                wire = np.ascontiguousarray(result, dtype=result.dtype.newbyteorder(">"))
-                store.setPlane(wire.tobytes(), z, c, t, conn.SERVICE_OPTS)
-                ranges[c] = [min(ranges[c][0], float(result.min())),
-                             max(ranges[c][1], float(result.max()))]
-        finally:
-            store.close(conn.SERVICE_OPTS)
+        with plane_reader(conn, image, timing) as get_plane:
+            store = conn.c.sf.createRawPixelsStore()
+            try:
+                store.setPixelsId(new_image.getPixelsId(), True, conn.SERVICE_OPTS)
+                for z, c, t, result in output_planes(get_plane, size_z, size_c, size_t,
+                                                     radii, projection):
+                    wire = np.ascontiguousarray(result, dtype=result.dtype.newbyteorder(">"))
+                    start = time.perf_counter()
+                    store.setPlane(wire.tobytes(), z, c, t, conn.SERVICE_OPTS)
+                    timing["write"] += time.perf_counter() - start
+                    ranges[c] = [min(ranges[c][0], float(result.min())),
+                                 max(ranges[c][1], float(result.max()))]
+            finally:
+                store.close(conn.SERVICE_OPTS)
         for c, (low, high) in enumerate(ranges):
             pixels_service.setChannelGlobalMinMax(new_image.getPixelsId(), c, low, high, conn.SERVICE_OPTS)
         add_provenance(conn, new_image, image, mapping, projection)
@@ -489,8 +533,12 @@ def run(conn, params):
     done, failed = [], []
     for index, (image, name) in enumerate(plan, start=1):
         print(f"Image {index}/{len(plan)}: {image.getId()} {image.getName()}", flush=True)
+        timing, start = {"read": 0.0, "write": 0.0}, time.perf_counter()
         try:
-            done.append(process_image(conn, image, radii, name, dataset, mapping, projection))
+            done.append(process_image(conn, image, radii, name, dataset, mapping, projection, timing))
+            print(f"Image {index}/{len(plan)}: {image.getId()} {image.getName()} done in "
+                  f"{time.perf_counter() - start:.1f} s (read {timing['read']:.1f} s, "
+                  f"write {timing['write']:.1f} s)", flush=True)
         except Exception as exc:
             failed.append(f"{image.getId()} {image.getName()}: {type(exc).__name__}: {exc}")
             print(failed[-1], flush=True)

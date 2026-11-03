@@ -8,8 +8,10 @@ Needs only NumPy, which OMERO itself uses (see ../README.md).
 """
 from __future__ import annotations
 
+import contextlib
 import datetime
 import fnmatch
+import time
 
 import numpy as np
 import omero
@@ -17,7 +19,7 @@ import omero.scripts as scripts
 from omero.gateway import BlitzGateway, DatasetWrapper, MapAnnotationWrapper
 from omero.rtypes import rint, rlong, robject, rstring
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 MAX_NAME_LENGTH = 255
 # Only these endings are removed to get the basename; anything else after a dot stays in the name.
 # Compound extensions come first, so .ome.tif is removed whole.
@@ -33,6 +35,7 @@ MAX_METHOD, SUM_METHOD, AVG_METHOD = METHODS
 SUFFIXES = {MAX_METHOD: "_mip", SUM_METHOD: "_sum", AVG_METHOD: "_avg"}
 # OMERO has no 64-bit integer pixel type, so integer sums are stored as uint32.
 NUMPY_TYPES = {"uint8": np.uint8, "uint16": np.uint16, "uint32": np.uint32, "float": np.float32}
+READ_TYPES = {t: NUMPY_TYPES[t] for t in SUPPORTED_TYPES}
 
 
 def requested_z(params):
@@ -138,6 +141,37 @@ def pixel_type(image):
     return image.getPrimaryPixels().getPixelsType().getValue()
 
 
+@contextlib.contextmanager
+def plane_reader(conn, image, timing):
+    """Yield get_plane(z, c, t) for image, reading every plane through one open RawPixelsStore.
+
+    omero-py's PixelsWrapper.getPlane() opens a new store (and so the original file, through
+    Bio-Formats) for every plane, and decodes with struct.unpack. This opens the file once per
+    image and decodes with np.frombuffer. Returns native-byte-order, writable 2D arrays (y, x).
+    Seconds spent reading are added to timing["read"] if timing is given.
+    """
+    size_x, size_y = image.getSizeX(), image.getSizeY()
+    wire = np.dtype(READ_TYPES[pixel_type(image)]).newbyteorder(">")  # OMERO sends big-endian
+    expected = size_x * size_y * wire.itemsize
+    store = conn.c.sf.createRawPixelsStore()
+    try:
+        store.setPixelsId(image.getPixelsId(), True, conn.SERVICE_OPTS)
+
+        def get_plane(z, c, t):
+            start = time.perf_counter()
+            raw = store.getPlane(z, c, t, conn.SERVICE_OPTS)
+            if len(raw) != expected:
+                raise ValueError(f"Plane z={z} c={c} t={t}: got {len(raw)} bytes, expected {expected}")
+            plane = np.frombuffer(raw, dtype=wire).reshape(size_y, size_x).astype(wire.newbyteorder("="))
+            if timing is not None:
+                timing["read"] += time.perf_counter() - start
+            return plane
+
+        yield get_plane
+    finally:
+        store.close(conn.SERVICE_OPTS)
+
+
 def needs_pyramid(image):
     store = image.getPrimaryPixels()._prepareRawPixelsStore()
     try:
@@ -241,8 +275,11 @@ def add_provenance(conn, new_image, source, method, out_type, z_range):
     new_image.linkAnnotation(annotation)
 
 
-def process_image(conn, image, method, name, out_type, z_range, dataset):
-    """Write one Z-projection of image into dataset, over z_range (None for the whole stack)."""
+def process_image(conn, image, method, name, out_type, z_range, dataset, timing):
+    """Write one Z-projection of image into dataset, over z_range (None for the whole stack).
+
+    Seconds spent reading and writing pixels are added to timing["read"] and timing["write"].
+    """
     pixels_service = conn.getPixelsService()
     update = conn.getUpdateService()
     size_z, size_c, size_t = image.getSizeZ(), image.getSizeC(), image.getSizeT()
@@ -266,17 +303,20 @@ def process_image(conn, image, method, name, out_type, z_range, dataset):
             pixels.setPixelsType(query.findByString("PixelsType", "value", out_type, conn.SERVICE_OPTS))
             update.saveObject(pixels, conn.SERVICE_OPTS)
         ranges = [[np.inf, -np.inf] for _ in range(size_c)]
-        store = conn.c.sf.createRawPixelsStore()
-        try:
-            store.setPixelsId(new_image.getPixelsId(), True, conn.SERVICE_OPTS)
-            for z, c, t, result in output_planes(image.getPrimaryPixels().getPlane, z_indices(z_range, size_z),
-                                                 size_c, size_t, method, out_type):
-                wire = np.ascontiguousarray(result, dtype=result.dtype.newbyteorder(">"))
-                store.setPlane(wire.tobytes(), z, c, t, conn.SERVICE_OPTS)
-                ranges[c] = [min(ranges[c][0], float(result.min())),
-                             max(ranges[c][1], float(result.max()))]
-        finally:
-            store.close(conn.SERVICE_OPTS)
+        with plane_reader(conn, image, timing) as get_plane:
+            store = conn.c.sf.createRawPixelsStore()
+            try:
+                store.setPixelsId(new_image.getPixelsId(), True, conn.SERVICE_OPTS)
+                for z, c, t, result in output_planes(get_plane, z_indices(z_range, size_z),
+                                                     size_c, size_t, method, out_type):
+                    wire = np.ascontiguousarray(result, dtype=result.dtype.newbyteorder(">"))
+                    start = time.perf_counter()
+                    store.setPlane(wire.tobytes(), z, c, t, conn.SERVICE_OPTS)
+                    timing["write"] += time.perf_counter() - start
+                    ranges[c] = [min(ranges[c][0], float(result.min())),
+                                 max(ranges[c][1], float(result.max()))]
+            finally:
+                store.close(conn.SERVICE_OPTS)
         for c, (low, high) in enumerate(ranges):
             pixels_service.setChannelGlobalMinMax(new_image.getPixelsId(), c, low, high, conn.SERVICE_OPTS)
         add_provenance(conn, new_image, image, method, out_type, z_range)
@@ -333,8 +373,12 @@ def run(conn, params):
     done, failed = [], []
     for index, (image, name, out_type, z_range) in enumerate(plan, start=1):
         print(f"Image {index}/{len(plan)}: {image.getId()} {image.getName()}", flush=True)
+        timing, start = {"read": 0.0, "write": 0.0}, time.perf_counter()
         try:
-            done.append(process_image(conn, image, method, name, out_type, z_range, dataset))
+            done.append(process_image(conn, image, method, name, out_type, z_range, dataset, timing))
+            print(f"Image {index}/{len(plan)}: {image.getId()} {image.getName()} done in "
+                  f"{time.perf_counter() - start:.1f} s (read {timing['read']:.1f} s, "
+                  f"write {timing['write']:.1f} s)", flush=True)
         except Exception as exc:
             failed.append(f"{image.getId()} {image.getName()}: {type(exc).__name__}: {exc}")
             print(failed[-1], flush=True)

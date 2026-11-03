@@ -78,6 +78,15 @@ Each output also gets:
 
 The script does not use OMERO's built-in projection service. That service clamps sums to the source type's maximum, which loses data. It also leaves out the last Z-plane for sum and average.
 
+## Performance
+
+- **One reader per image.** Each image's original file is opened once, through one `RawPixelsStore`, and every plane is read from it. omero-py's `getPlane()` opens a new store, and so reopens the file through Bio-Formats, for every plane.
+- **Fast decoding.** Planes are decoded with `np.frombuffer` instead of omero-py's `struct.unpack`, which is about 100 times slower.
+- **Timing in stdout.** After each image, the job's stdout (shown in OMERO.web's activities panel) has a line such as `Image 3/12: 1234 cells.tif done in 14.2 s (read 1.1 s, write 0.6 s)`. Compute time is the rest. The `Message` output is unchanged.
+- The size check during planning (including dry runs) still opens each image's file once, to ask OMERO whether the image is too large for whole-plane reads.
+
+These changes affect speed only; the output pixels are meant to be identical to earlier versions. That, and the speed-up itself, has not yet been checked on the OMERO server.
+
 ## Installing (OMERO admin)
 
 1. In OMERO.web, open **Scripts → Upload Script** and upload this script into the same folder as the others, such as `/jefflee_lab`. [Installing a script](../README.md#installing-a-script) has the details and the other ways to install.

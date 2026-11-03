@@ -62,6 +62,15 @@ Fixed settings:
 - negative corrected values clipped to 0;
 - integer outputs rounded half up.
 
+## Performance
+
+- **One reader per image.** Each image's original file is opened once, through one `RawPixelsStore`, and every plane is read from it. omero-py's `getPlane()` opens a new store, and so reopens the file through Bio-Formats, for every plane.
+- **Fast decoding.** Planes are decoded with `np.frombuffer` instead of omero-py's `struct.unpack`, which is about 100 times slower.
+- **Timing in stdout.** After each image, the job's stdout (shown in OMERO.web's activities panel) has a line such as `Image 3/12: 1234 cells.tif done in 14.2 s (read 1.1 s, write 0.6 s)`. Compute time is the rest. The `Message` output is unchanged.
+- The size check during planning (including dry runs) still opens each image's file once, to ask OMERO whether the image is too large for whole-plane reads.
+
+These changes affect speed only; the output pixels are meant to be identical to earlier versions. That, and the speed-up itself, has not yet been checked on the OMERO server.
+
 ## Installing (OMERO admin)
 
 The server needs no conda; everything runs in the OMERO server's own Python. SciPy 1.17.1 is already installed there (see [Server environment](../README.md#server-environment)).
@@ -123,6 +132,7 @@ python -m unittest test_local -v
 
 ## Changelog
 
+- **0.5.0 (2026-11-03):** Faster pixel reading (see [Performance](#performance)): one reader per image instead of one per plane, `np.frombuffer` decoding, and per-image timing in stdout. Outputs are meant to be unchanged.
 - **0.4.2 (2026-10-26):** ImageJ-parity fixes, taken from the original. (1) The rolling-ball patch width rounds halves up as Java does; before, radii such as 11, 15, 17, 21, 27, 34, 38, 46, 50, 58, 70, 82, 94, 108, 132, 140, 156, 164, 188, 212, 220, 236, 244, 268, 292 and 300 (and non-integers such as 7.5) used a patch 2 px too narrow, which gave backgrounds off by up to about 7% of the image range. Radii such as 10 and 100 were not affected. (2) Shrinking is skipped only when the shrunken image would be under 2 px (ceiling, not floor), as in ImageJ. (3) The 3x3 presmooth runs along x, then y. The algorithm source now points at `misc/python-rolling-ball`. The annotation key `algorithm_source` replaces `algorithm_commit` and `algorithm_sha256`.
 
 The earlier multi-package version (v0.1.0, with a separate uv worker, external adapter and journal/resume) is kept in git commit `84108b4`.

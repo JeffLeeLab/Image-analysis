@@ -217,6 +217,110 @@ class OutputPlanes(unittest.TestCase):
             self.assertTrue(np.array_equal(plane, expected.astype(plane.dtype)))
 
 
+class FakeStore:
+    """RawPixelsStore that serves planes of a (z, c, t, y, x) stack as big-endian bytes."""
+    def __init__(self, stack, wire):
+        self.stack, self.wire = stack, wire
+        self.pixels_ids, self.reads, self.closed = [], [], False
+
+    def setPixelsId(self, pixels_id, bypass, ctx=None):
+        self.pixels_ids.append(pixels_id)
+
+    def getPlane(self, z, c, t, ctx=None):
+        self.reads.append((z, c, t))
+        return self.stack[z, c, t].astype(self.wire).tobytes()
+
+    def close(self, ctx=None):
+        self.closed = True
+
+
+class PlaneReader(unittest.TestCase):
+    wires = {"uint8": "u1", "uint16": ">u2", "float": ">f4"}
+
+    def reader(self, stack, pixel_type, store=None, timing=None):
+        """plane_reader over stack, plus the fake store and the number of stores created."""
+        store = store or FakeStore(stack, self.wires[pixel_type])
+        created = []
+        conn = SimpleNamespace(c=SimpleNamespace(sf=SimpleNamespace(
+            createRawPixelsStore=lambda: created.append(store) or store)), SERVICE_OPTS=None)
+        image = SimpleNamespace(
+            getPixelsId=lambda: 42, getSizeX=lambda: stack.shape[4], getSizeY=lambda: stack.shape[3],
+            getPrimaryPixels=lambda: SimpleNamespace(
+                getPixelsType=lambda: SimpleNamespace(getValue=lambda: pixel_type)))
+        return script.plane_reader(conn, image, timing), store, created
+
+    def stack(self, pixel_type, shape=(3, 2, 1, 5, 7)):  # z, c, t, y, x; non-square planes
+        rng = np.random.default_rng(3)
+        if pixel_type == "float":
+            return rng.normal(100, 20, shape).astype(np.float32)
+        return rng.integers(0, 250 if pixel_type == "uint8" else 60000, shape).astype(pixel_type)
+
+    def test_round_trip(self):
+        for pixel_type in self.wires:
+            stack = self.stack(pixel_type)
+            reader, _, _ = self.reader(stack, pixel_type)
+            with reader as get_plane:
+                plane = get_plane(2, 1, 0)
+            self.assertEqual(plane.shape, (5, 7))
+            self.assertEqual(plane.dtype, stack.dtype)
+            self.assertIn(plane.dtype.byteorder, "=|")
+            self.assertTrue(plane.flags.writeable)
+            self.assertTrue(np.array_equal(plane, stack[2, 1, 0]))
+
+    def test_one_store_per_image(self):
+        stack = self.stack("uint16")
+        reader, store, created = self.reader(stack, "uint16")
+        with reader as get_plane:
+            for z in range(3):
+                for c in range(2):
+                    get_plane(z, c, 0)
+        self.assertEqual(len(created), 1)
+        self.assertEqual(store.pixels_ids, [42])
+        self.assertEqual(len(store.reads), 6)
+
+    def test_store_closed(self):
+        stack = self.stack("uint16")
+        reader, store, _ = self.reader(stack, "uint16")
+        with reader:
+            pass
+        self.assertTrue(store.closed)
+        reader, store, _ = self.reader(stack, "uint16")
+        with self.assertRaises(RuntimeError):
+            with reader:
+                raise RuntimeError("boom")
+        self.assertTrue(store.closed)
+
+    def test_wrong_byte_count_rejected(self):
+        stack = self.stack("uint16")
+        store = FakeStore(stack, ">u2")
+        store.getPlane = lambda z, c, t, ctx=None: stack[z, c, t].astype(">u2").tobytes()[:-2]
+        reader, _, _ = self.reader(stack, "uint16", store)
+        with reader as get_plane:
+            with self.assertRaisesRegex(ValueError, "z=1 c=0 t=0"):
+                get_plane(1, 0, 0)
+        self.assertTrue(store.closed)
+
+    def test_read_time_recorded(self):
+        stack = self.stack("uint8")
+        timing = {"read": 0.0, "write": 0.0}
+        reader, _, _ = self.reader(stack, "uint8", timing=timing)
+        with reader as get_plane:
+            get_plane(0, 0, 0)
+        self.assertGreater(timing["read"], 0)
+
+    def test_feeds_output_planes(self):
+        stack = self.stack("uint16", (6, 2, 1, 5, 7))
+        expected = list(script.output_planes(lambda z, c, t: stack[z, c, t], script.z_indices((2, 4), 6),
+                                             2, 1, SUM, "uint32"))
+        reader, _, _ = self.reader(stack, "uint16")
+        with reader as get_plane:
+            planes = list(script.output_planes(get_plane, script.z_indices((2, 4), 6), 2, 1, SUM, "uint32"))
+        self.assertEqual([p[:3] for p in planes], [p[:3] for p in expected])
+        for (_, c, t, plane), (*_, direct) in zip(planes, expected):
+            self.assertTrue(np.array_equal(plane, direct))
+            self.assertTrue(np.array_equal(plane, stack[1:4, c, t].sum(axis=0)))
+
+
 class Dialog(unittest.TestCase):
     params = {p.name(): p for p in script.parameters()}
 
